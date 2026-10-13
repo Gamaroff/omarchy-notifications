@@ -9,6 +9,7 @@ import qs.Ui
 import "components"
 import "Store.js" as Store
 import "lib/SlackLink.js" as SlackLink
+import "lib/Mute.js" as Mute
 
 // A notification center for Omarchy: everything you were sent, still there
 // when you go back for it.
@@ -173,6 +174,34 @@ Panel {
 
   function remove(key) {
     if (store) store.remove(key)
+  }
+
+  // The text a mute rule is built from: the first line of the message, or the
+  // title when there is no message. Semicolons separate rules, so text that
+  // contains one cannot be made into a rule.
+  function muteRuleFor(row) {
+    if (!row) return ""
+    var candidates = [String(row.body || "").split("\n")[0], String(row.summary || "")]
+    for (var i = 0; i < candidates.length; i++) {
+      var text = candidates[i].trim()
+      if (text !== "" && text.indexOf(";") === -1) return text
+    }
+    return ""
+  }
+
+  // Appends a rule to the setting, the same one the settings screen edits, so
+  // it persists in shell.json and shows up there.
+  function mute(row) {
+    var rule = muteRuleFor(row)
+    var host = bar && bar.shell ? bar.shell : null
+    if (rule === "" || !host || typeof host.updateEntryInline !== "function") return
+    var current = String(mutedNotifications || "").trim()
+    if (Mute.parse(current).indexOf(rule.toLowerCase()) !== -1) return
+    var merged = {}
+    for (var k in settings) merged[k] = settings[k]
+    merged.id = moduleName
+    merged.mutedNotifications = current === "" ? rule : current + "; " + rule
+    host.updateEntryInline(moduleName, merged)
   }
 
   function clearAll() {
@@ -646,7 +675,9 @@ Panel {
             fontFamily: root.fontFamily
 
             onClicked: root.activate(row.model)
+            muteRule: root.muteRuleFor(row.model)
             onRemoveRequested: root.remove(row.model.key)
+            onMuteRequested: root.mute(row.model)
           }
         }
 

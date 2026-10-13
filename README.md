@@ -63,7 +63,7 @@ icon and all, and keeps it for 30 days.
 | Clicking a notification | Auto | Opens the picture or the Slack conversation, or focuses the app. Or neither. |
 | Show the message text | on | Off leaves the sender and subject only. |
 | Show pictures | on | Off stops keeping copies as well. |
-| Hide notifications containing | empty | Text separated by semicolons, e.g. `Claude is waiting for your input; Software update`. Matched in any case against app, title and message. Hidden ones stay in the archive. |
+| Hide notifications containing | empty | Text separated by semicolons, e.g. `Claude is waiting for your input; Software update`. Matched in any case against app, title and message. Hidden ones stay in the archive. The **Mute** button on a card (shown on hover) adds its message text here. |
 | Panel width | 420 | In the shell's spacing units. |
 | List height | 0 | 0 runs the list to the bottom of the screen. |
 

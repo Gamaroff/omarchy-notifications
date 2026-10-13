@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Effects
+import QtQuick.Controls
 import Quickshell
 import qs.Commons
 import qs.Commons as Commons
@@ -43,8 +44,13 @@ Item {
 
   signal clicked()
   signal removeRequested()
+  signal muteRequested()
 
   readonly property bool hovered: hover.hovered
+  // Whether there is any text to build a mute rule from, and what it would be;
+  // the panel decides, the row only shows it.
+  property string muteRule: ""
+  readonly property bool canMute: muteRule !== ""
   // Per-notification media first (an avatar, album art), then the web app the
   // notification came from, then the app's own icon. The web app goes ahead of
   // app_icon because a browser fills that in with its own logo for every site.
@@ -230,6 +236,7 @@ Item {
           id: appLabel
           anchors.left: parent.left
           width: parent.width - whenLabel.implicitWidth - Style.space(20)
+                - (root.hovered && root.canMute ? mute.width + Style.space(4) : 0)
           text: root.app
           elide: Text.ElideRight
           font.family: root.fontFamily
@@ -251,6 +258,43 @@ Item {
           font.pixelSize: Style.font.caption
           color: root.foreground
           opacity: 0.45
+        }
+
+        // Hides every notification with this same text, now and from here on.
+        Rectangle {
+          id: mute
+          anchors.right: dismiss.left
+          anchors.rightMargin: Style.space(4)
+          anchors.verticalCenter: parent.verticalCenter
+          visible: root.hovered && root.canMute
+          width: muteLabel.implicitWidth + Style.space(12)
+          height: dismiss.height
+          radius: height / 2
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b,
+                         muteMouse.containsMouse ? 0.25 : 0.15)
+
+          Text {
+            id: muteLabel
+            textFormat: Text.PlainText
+            anchors.centerIn: parent
+            text: "Mute"
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            color: root.foreground
+            opacity: 0.8
+          }
+
+          MouseArea {
+            id: muteMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.muteRequested()
+          }
+
+          ToolTip.visible: muteMouse.containsMouse
+          ToolTip.delay: 400
+          ToolTip.text: "Hide notifications containing \u201c" + root.muteRule + "\u201d"
         }
 
         Rectangle {
