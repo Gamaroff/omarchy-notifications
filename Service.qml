@@ -4,6 +4,7 @@ import Quickshell.Io
 import "components/WebApps.js" as WebApps
 
 import "Store.js" as Store
+import "lib/Mute.js" as Mute
 
 // The archive, mounted once for the shell.
 //
@@ -28,6 +29,16 @@ Item {
   property int maxItems: 1000
   property bool showPreview: true
   property int pageSize: 500
+
+  // Semicolon-separated rules for notifications to hide; see lib/Mute.js.
+  // Filtered here rather than in the archive, so a rule can be dropped again.
+  property string mutedNotifications: ""
+  readonly property var muteRules: Mute.parse(mutedNotifications)
+  onMuteRulesChanged: {
+    forceReset = true
+    load()
+  }
+  property bool forceReset: false
 
   property var entries: []
   property double lastSeen: 0
@@ -141,6 +152,7 @@ Item {
       return
     }
     if (!entry || !entry.key) return
+    if (Mute.isMuted(entry, muteRules)) return
     // close_write and moved_to both fire for one popup; the second is dropped
     // by key. One watcher for the shell, so this is no longer a per-screen race.
     for (var i = 0; i < entries.length; i++)
@@ -188,9 +200,12 @@ Item {
           return
         }
         if (!Array.isArray(data)) return
+        data = Mute.filter(data, root.muteRules)
         var wasLoaded = root.loaded
         root.loaded = true
-        if (wasLoaded && !root.differsFrom(data)) return
+        var forced = root.forceReset
+        root.forceReset = false
+        if (wasLoaded && !forced && !root.differsFrom(data)) return
         root.entries = data
         root.entriesReset()
       }

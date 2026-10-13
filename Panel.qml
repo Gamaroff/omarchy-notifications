@@ -53,6 +53,7 @@ Panel {
   readonly property string clickAction: setting("clickAction", "Auto")
   readonly property bool showBody: setting("showBody", true)
   readonly property bool showPreview: setting("showPreview", true)
+  readonly property string mutedNotifications: setting("mutedNotifications", "")
 
   // ------------------------------------------------------------- the service
   //
@@ -109,12 +110,14 @@ Panel {
     store.keepDays = keepDays
     store.maxItems = maxItems
     store.showPreview = showPreview
+    store.mutedNotifications = mutedNotifications
   }
 
   onBarChanged: bindStore()
   onKeepDaysChanged: pushSettings()
   onMaxItemsChanged: pushSettings()
   onShowPreviewChanged: pushSettings()
+  onMutedNotificationsChanged: pushSettings()
 
   Timer {
     interval: 200

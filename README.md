@@ -1,4 +1,8 @@
-# Notification Center
+# Notification Center (Gamaroff fork)
+
+Fork of [jankeesvw/omarchy-notification-center](https://github.com/jankeesvw/omarchy-notification-center)
+with a **Hide notifications containing** setting for muting noisy kinds of
+notification, such as Claude Code's "waiting for your input".
 
 An [Omarchy](https://omarchy.org) bar widget that keeps the notifications you
 were sent. A bell on the right of the bar, a dot on it when something has come
@@ -59,6 +63,7 @@ icon and all, and keeps it for 30 days.
 | Clicking a notification | Auto | Opens the picture or the Slack conversation, or focuses the app. Or neither. |
 | Show the message text | on | Off leaves the sender and subject only. |
 | Show pictures | on | Off stops keeping copies as well. |
+| Hide notifications containing | empty | Text separated by semicolons, e.g. `Claude is waiting for your input; Software update`. Matched in any case against app, title and message. Hidden ones stay in the archive. |
 | Panel width | 420 | In the shell's spacing units. |
 | List height | 0 | 0 runs the list to the bottom of the screen. |
 
@@ -110,7 +115,7 @@ omarchy-shell jankeesvw.notification-center toggle
 
 ## Tests
 
-The Slack matching has unit tests. Run them from the plugin directory with
+The Slack matching and the mute rules have unit tests. Run them from the plugin directory with
 `node --test`.
 
 ## Licence
