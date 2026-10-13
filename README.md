@@ -1,4 +1,4 @@
-# Notification Center (Gamaroff fork)
+# Omarchy Notifications
 
 Fork of [jankeesvw/omarchy-notification-center](https://github.com/jankeesvw/omarchy-notification-center)
 with a **Hide notifications containing** setting for muting noisy kinds of
@@ -16,7 +16,7 @@ minutes later, in the middle of something else: *what did that say?*
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/jankeesvw/omarchy-notification-center.git --enable
+omarchy plugin add https://github.com/Gamaroff/omarchy-notifications.git --enable
 ```
 
 Needs `jq` and `inotifywait`, both of which Omarchy already has. Leave the bell
@@ -83,7 +83,7 @@ answer to it.
 Removing the plugin leaves the archive alone, on purpose:
 
 ```bash
-omarchy plugin remove jankeesvw.notification-center
+omarchy plugin remove gamaroff.notifications
 rm -rf ~/.local/state/omarchy-notification-center
 ```
 
@@ -110,7 +110,7 @@ notification-center list 2000 | jq -r '.[] | select(.app == "Slack") | "\(.summa
 The panel opens over IPC, which is how you bind it to a key:
 
 ```bash
-omarchy-shell jankeesvw.notification-center toggle
+omarchy-shell gamaroff.notifications toggle
 ```
 
 ## Tests

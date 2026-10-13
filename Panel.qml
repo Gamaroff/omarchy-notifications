@@ -33,8 +33,8 @@ import "lib/Mute.js" as Mute
 Panel {
   id: root
 
-  moduleName: "jankeesvw.notification-center"
-  ipcTarget: "jankeesvw.notification-center"
+  moduleName: "gamaroff.notifications"
+  ipcTarget: "gamaroff.notifications"
 
   readonly property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   readonly property string slackLogPath:
@@ -97,7 +97,7 @@ Panel {
     }
     var host = bar && bar.shell ? bar.shell : null
     var s = host && typeof host.serviceFor === "function"
-      ? host.serviceFor("jankeesvw.notification-center") : null
+      ? host.serviceFor("gamaroff.notifications") : null
     // Replacement bars hand widgets a service-less facade; see Store.js.
     if (!s) s = Store.get()
     if (!s) return

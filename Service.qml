@@ -237,7 +237,7 @@ Item {
   Component.onDestruction: Store.clear(root)
 
   IpcHandler {
-    target: "jankeesvw.notification-center.test"
+    target: "gamaroff.notifications.test"
 
     function seed(count: int): string {
       Quickshell.execDetached(root.storeCommand(["seed", String(count > 0 ? count : 25)]))
