@@ -5,6 +5,8 @@
 archive.jsonl
 *.jsonl
 *.local.*
+# agent-skills pipeline run state (develop-next, develop-story locks)
+.claude/state/
 # Agent standards: worktrees and local agent links (.agents/standards/docs/development/agents/agent-files.md)
 .worktrees/
 CLAUDE.md
