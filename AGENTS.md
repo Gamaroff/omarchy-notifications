@@ -13,9 +13,9 @@ own Linux desktop.
 ## Commands
 
 - Tests: `node --test`, from the repo root (well under a second; 17 tests, no dependencies to install).
-- Lint: none configured.
+- Lint: `shellcheck bin/notification-center` (shellcheck 0.11; QML and JS are not linted).
 - Quality gate (also `skills-config.yaml` `develop.fastGateCommand` and `developNext.qualityGateCommand`):
-  `node --test`.
+  `shellcheck bin/notification-center && node --test`.
 - Plugin check: `omarchy plugin validate <plugin-folder>` checks a folder against Omarchy's manifest schema.
 
 ## Layout

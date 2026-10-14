@@ -18,11 +18,11 @@ devLoadAlwaysFiles:
   - docs/architecture/concepts/source-tree.md
 
 develop:
-  # The suite runs in well under a second, so it is cheap enough to run every iteration.
-  fastGateCommand: node --test
+  # Both run in well under a second, so it is cheap enough to run every iteration.
+  fastGateCommand: shellcheck bin/notification-center && node --test
 
 developNext:
   # No CI runs on PRs here, so this is the whole merge gate.
-  qualityGateCommand: node --test
+  qualityGateCommand: shellcheck bin/notification-center && node --test
 
 tracker: github

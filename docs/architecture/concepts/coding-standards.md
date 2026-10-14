@@ -18,7 +18,7 @@ Taken from the existing code. Extend as decisions are made.
 
 ## Linting
 
-- None configured. `bin/notification-center` passes `shellcheck` clean; keep it that way.
+- `shellcheck bin/notification-center`, part of the quality gate. QML and JS are not linted.
 - New logic goes in a `.pragma library` file with a `node:test` suite, so it can be tested outside QML.
 
 ## Patterns to avoid
