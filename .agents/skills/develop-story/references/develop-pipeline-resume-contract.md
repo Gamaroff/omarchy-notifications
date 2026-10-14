@@ -1,0 +1,760 @@
+---
+name: develop-pipeline-resume-contract
+description: Resume verification contract shared by develop-story and develop-task. Covers per-step artifact verification, plan freshness check, MAX_ITER=5 stall semantics, QA cycle count reconstruction, and branch/PR cross-check. File naming patterns differ between story and task — both listed. Step 8 push command is a normal-flow concern (not a resume concern); it lives inline in each SKILL.md under the `### Step 8: Commit Changes` section.
+---
+<!-- AUTO-GENERATED — DO NOT EDIT. Source: shared/resources/develop-pipeline-resume-contract.md. Regenerate via `npm run bundle`. -->
+
+# Develop Pipeline — Resume Verification Contract
+
+## When This Contract Applies
+
+This contract is invoked during Phase 0 of `/develop-story` or `/develop-task` when resuming a previous pipeline run. Phase 0a (stale-context detector) runs first; Phase 0b (artifact verification) uses its output to narrow the verification scope.
+
+---
+
+## Phase 0a — Stale-Context Detector Dispatch
+
+Dispatch a **read-only Explore subagent** using the prompt in `references/pipeline-resume-detector-prompt.md`. The subagent reads the lock file, lists step summaries, and diffs artifact mtimes — returning `recommended_step`, `deltas_since_pause`, and `blocking_issues`. The orchestrator never re-reads raw artifacts itself; the subagent does the reading.
+
+### Dispatch
+
+```
+Dispatch Explore subagent with the full content of references/pipeline-resume-detector-prompt.md as its prompt.
+Pass task_or_story_directory from the lock file as context.
+```
+
+### Consume Output
+
+The detector is **read-only and returns JSON** — it writes nothing (detector prompt § Invocation
+Context). The orchestrator therefore **persists what it returned** to the same place every other
+subagent summary lives, `{doc-directory}/.summaries/` (`subagent-summary-artifact.md`), and every
+later block in this section reads that file. A block that names a file no step writes is a block
+that runs on nothing (task.130 QA cycle 3, bug 7); a fence that names a variable no fence assigns
+HALTs at its own guard (cycle 2, bug 5). **Bind once, here:**
+
+```bash
+# 1. Persist the JSON the Explore dispatch RETURNED — verbatim, from the tool result, into the
+#    pipeline's summary directory. The quoted heredoc keeps the JSON's own quotes and $ intact.
+# Every {doc-directory} substitution in THIS section's two blocks is QUOTED — a document
+# directory with a space splits into two words otherwise (task.130 gate 5 CR-7; task.133).
+# The contract's other fences (the --restore command, the grant call) are not yet quoted;
+# quoting them is a recorded follow-up (task.133 gate 1 CR-2), not a claim made here.
+mkdir -p "{doc-directory}/.summaries"
+cat > "{doc-directory}/.summaries/step-0a-resume-detector.json" <<'DETECTOR_EOF'
+{the JSON object the detector returned, pasted verbatim}
+DETECTOR_EOF
+# 2. Bind and validate. `deltas_since_pause` must be an ARRAY OF OBJECTS here, because the
+#    delete block below reads it as one — the detector's notes ("stale snapshot for <other dir>
+#    ignored", both `stale-snapshot check skipped — …` notes) are delta objects too, never bare
+#    strings (detector prompt § deltas_since_pause object fields; cycle 3, bug 6). A shape this
+#    check accepts and the delete block refuses would give one input two prescribed outcomes.
+DETECTOR_JSON=$(cat "{doc-directory}/.summaries/step-0a-resume-detector.json")
+printf '%s' "$DETECTOR_JSON" \
+  | jq -e '.schema_version == 1 and (.recommended_step | type == "number")
+           and (.blocking_issues | type == "array")
+           and (.deltas_since_pause | type == "array") and all(.deltas_since_pause[]; type == "object")' >/dev/null
+```
+
+If validation fails (parse error, missing required fields, a non-array or a non-object element in
+`deltas_since_pause`): log `"⚠️ Detector output invalid — falling back to full Phase 0b
+verification"`, **skip the delete block below** (it acts only on validated output), and proceed to
+Phase 0b using `current_step` from the lock as the upper bound (treat all steps as unverified).
+
+**Delete what the detector proved stale — here, once, verified against the disk, not the label.**
+The detector is read-only; when it finds a `last-halt.json` for this document whose PR is `MERGED`
+it reports the file as a `deltas_since_pause` object whose `concern` is **exactly**
+`stale-snapshot: PR merged` and whose `path` names it, and leaves the file in place (detector
+prompt, Step 1 item 2). This is the **one** statement of the delete — the three orchestrators cite
+this section and carry no copy of the loop (task.130, PR #436 review CR-3). The label selects the
+candidates; **the evidence is re-read from disk before anything is removed** — the snapshot's own
+`task_or_story_directory` must be this document's, and its `pr_url` must read `MERGED` now — because
+a delete gated on a subagent's label alone is the same trust this task removed from the detector's
+own `rm` (cycle 3, bug 8). **Only after the schema check above passed**, and before Phase 0b.
+The block re-reads the **persisted file**, never a variable from the previous fence — every
+orchestrator Bash call is a fresh shell, and a fence that depends on another fence's variable
+HALTs on every real run (cycle 4, bug 9):
+
+```bash
+# Every `stale-snapshot: PR merged` delta names a snapshot the detector proved belongs to a MERGED
+# run. The detector is read-only; THIS is where it is deleted — verified, one path per rm, re-read
+# afterwards. Six rules, each from a QA cycle that found the previous shape wrong by executing it:
+# 1. EXACT label, never a prefix (cycle 2, bug 3): the two SKIP notes share the prefix.
+# 2. CONTAINMENT (cycle 2, bug 4): the rule applies to ONE file; any other path, or a missing one
+#    (jq prints the literal `null`), is a HALT, never an rm.
+# 3. FAIL CLOSED (cycle 1, bug 2): list materialised with jq's exit read; `(.concern // "")`;
+#    `jq -r` not `-e` (-e exits 4 on the ordinary empty result); here-string loop so `exit 1`
+#    ends the block under bash.
+# 4. VALIDATE ALL, THEN DELETE (cycle 3, CR-5): the containment HALT says "nothing deleted", so
+#    every path is checked before the first rm.
+# 5. EVIDENCE FROM DISK (cycle 3, bug 8): directory match is a HALT on mismatch; the PR state is
+#    re-read with gh — a failed, non-MERGED or ABSENT pr_url KEEPS the snapshot and says so,
+#    because a failed read is never evidence of MERGED (detector prompt, Step 1 item 2).
+# 6. THE FILE IS THE CARRIER (cycle 4, bug 9): every orchestrator Bash call is a fresh shell, so
+#    a variable the bind block set does not exist here. This block re-binds from the artifact
+#    the bind block persisted and HALTs only when that file is absent — which means the bind
+#    block did not run.
+# Two more, each a case that used to share another's output (task.133):
+# 7. NAME THE EVIDENCE FAILURE: an unparsable snapshot, a parsed object with no directory, and
+#    another document's directory are three different defects — three HALT texts, not one
+#    "'absent'" for the first two (task.130 5c CR-3).
+# 8. NO SILENT LABEL: a concern that starts "stale-snapshot" but is neither the verdict nor a
+#    skip note is printed "unrecognised … kept" — the snapshot stays, and the operator sees why
+#    (task.130 gate 5 CR-5).
+DETECTOR_FILE="{doc-directory}/.summaries/step-0a-resume-detector.json"
+[ -s "$DETECTOR_FILE" ] || { echo "HALT: $DETECTOR_FILE is absent or empty — run the bind-and-validate block first; nothing deleted"; exit 1; }
+DETECTOR_JSON=$(cat "$DETECTOR_FILE")
+SNAPSHOT_PATH=.claude/state/develop-pipeline.last-halt.json
+STALE_PATHS=$(printf '%s' "$DETECTOR_JSON" \
+  | jq -r '[ .deltas_since_pause[] | select(type == "object")
+             | select((.concern // "") == "stale-snapshot: PR merged")
+             | (.path | if type == "string" and length > 0 then . else error("stale-snapshot delta without a string path") end) ]
+           | .[]' 2>&1) \
+  || { echo "HALT: could not read stale-snapshot deltas from the detector output — $STALE_PATHS"; exit 1; }
+# A prefix match that is neither the verdict nor a skip note is a label nothing acts on: say so.
+printf '%s' "$DETECTOR_JSON" \
+  | jq -r '.deltas_since_pause[] | select(type == "object") | (.concern // "") | select(type == "string")
+           | select(startswith("stale-snapshot") and . != "stale-snapshot: PR merged"
+                    and (startswith("stale-snapshot check skipped") | not))' 2>/dev/null \
+  | while IFS= read -r c; do echo "unrecognised stale-snapshot label — kept: '$c'"; done
+canon() { local s; s=$(printf '%s' "$1" | sed -E 's#^\./##; s#/+$##'); (cd "$(dirname "$s")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$s")") || printf '%s' "$s"; }
+# Pass 1 — every path must be THE snapshot path; nothing is removed until all are.
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  [ "$(canon "$p")" = "$(canon "$SNAPSHOT_PATH")" ] \
+    || { echo "HALT: the detector reported a stale-snapshot path outside the rule — '$p' is not $SNAPSHOT_PATH; nothing deleted"; exit 1; }
+done <<< "$STALE_PATHS"
+# Pass 2 — re-read the evidence from the file itself, then delete and re-read the directory.
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  [ -f "$p" ] || { echo "stale snapshot $p already absent — nothing to delete"; continue; }
+  jq -e 'type == "object"' "$p" >/dev/null 2>&1 \
+    || { echo "HALT: $p is not a JSON object — its evidence cannot be read; the detector mislabelled it; nothing deleted"; exit 1; }
+  SNAP_DIR=$(jq -r '.task_or_story_directory // ""' "$p")
+  [ -n "$SNAP_DIR" ] \
+    || { echo "HALT: $p carries no task_or_story_directory — a legacy snapshot is no document's by evidence; the detector mislabelled it; nothing deleted"; exit 1; }
+  [ "$(canon "$SNAP_DIR")" = "$(canon "{doc-directory}")" ] \
+    || { echo "HALT: $p is not a snapshot for {doc-directory} (task_or_story_directory: '$SNAP_DIR') — the detector mislabelled it; nothing deleted"; exit 1; }
+  SNAP_PR=$(jq -r '.pr_url // ""' "$p" 2>/dev/null)
+  # An EMPTY pr_url is "no merge evidence" — and `gh pr view ""` would silently resolve the CURRENT
+  # branch's PR instead of failing, so the guard comes BEFORE the call (cycle 4, bug 11).
+  if [ -z "$SNAP_PR" ]; then
+    echo "stale snapshot $p KEPT — it names no pr_url, so there is no merge evidence to re-read"
+    continue
+  fi
+  PR_STATE=$(gh pr view "$SNAP_PR" --json state --jq .state 2>/dev/null || true)
+  if [ "$PR_STATE" != "MERGED" ]; then
+    echo "stale snapshot $p KEPT — its PR ($SNAP_PR) did not read MERGED on re-check (read: '${PR_STATE:-failed}'); a failed read is never evidence of a merge"
+    continue
+  fi
+  rm -f "$p"
+  [ ! -f "$p" ] || { echo "HALT: stale snapshot $p survived deletion — remove it by hand and re-invoke"; exit 1; }
+  echo "stale snapshot $p removed (PR $SNAP_PR is MERGED; directory matches)"
+done <<< "$STALE_PATHS"
+```
+
+The re-read is the point: a delete that is reported and not verified is the failure mode this
+section replaces, one layer up. The label the block matches is the one the detector prompt
+defines for a **proven** merge; the two skip notes share the `stale-snapshot` prefix by design
+(one label per cause) and are never acted on — and even the verdict label is not acted on until
+the snapshot itself says the same thing. Any **other** `stale-snapshot`-prefixed concern is not
+acted on either, but it is **printed** (`unrecognised stale-snapshot label — kept: '…'`): a label
+nothing recognises is a detector that drifted, and silence would hide it.
+
+### Surface Results to User
+
+Always surface the detector output before proceeding, in this format:
+
+```
+⚙️ Resume detector result
+  Recommended step:   {recommended_step}
+  Lock step:          {current_step_in_lock}
+  Summaries seen:     {summaries_seen | join(", ") or "none"}
+  Deltas since pause: {N} — {paths or "none"}
+  Blocking issues:    {blocking_issues | join("; ") or "none"}
+```
+
+Wait for user confirmation before proceeding to Phase 0b. If the user disputes `recommended_step`, accept their correction and record it in the Decisions Log.
+
+### Handle Blocking Issues
+
+If `blocking_issues` is non-empty: **HALT** — display each issue to the user and require manual resolution before resuming. Do not proceed to Phase 0b.
+
+### Restore the lock (both resume paths)
+
+<!-- who-restores: statement -->
+
+When `source` is `halt_snapshot` or `orphaned_claim` and the operator chooses Resume, the lock does
+not exist — a HALT or pause removed it, and a resume skips Step 1, its only ordinary writer. **Who
+restores depends on the snapshot's `halt_reason`** (task.124 QA cycle 3, CR-1) **and, for a
+Step 7 halt, on what the fix changed** (task.170):
+
+- `halt_reason` matches `loop-limit|not-converging` **in `develop-task` or `develop-story`** →
+  **do not restore here.** The Phase 0b prompt is the grant prompt (**Re-entry after a QA loop
+  escalation**, below), and `grant-qa-cycles.sh` restores through `--restore` **only after its
+  never-lower guard passes**. A declined or refused grant therefore restores nothing and consumes
+  nothing — the task.123 CR-1 rule — and the run returns to the halt message's own three options
+  with the snapshot still on disk. **`develop-bug` has no grant prompt**: its verify loop's
+  limit HALT is escalated, not re-entered, so a `develop-bug` snapshot takes the next bullet
+  whatever its `halt_reason` reads (task.124 QA cycle 5, CR-1 — an earlier revision stated this
+  bullet for all three pipelines while develop-bug's own Step 0-lock said the opposite).
+- `halt_step` 7 **in `develop-task` or `develop-story`** with the work item's newest DoD file at
+  `**Final Status:** ❌ GAPS` → **do not restore here.** Phase 0b offers **"Re-enter QA at 5a"**
+  (Recommended) beside the halt's own options, and on accept runs `reenter-qa-after-finalise.sh`,
+  which restores and lowers the lock in one call (**Re-entry after a finalise DoD-gaps halt**,
+  below). **Whether code moved is the script's to measure, not the reader's to judge** — a committed
+  change outside the work item is easy to miss by eye, and a missed one would re-run `/finalise`
+  over an ungated head. **What follows a refusal is its route in the refusal list below** — the one
+  statement of it: a declined offer, or a refusal routed to step 7 (`no-code-moved` among them),
+  takes the next bullet; a refusal the list routes back to the operator — `uncommitted-fix`,
+  `git-unreadable`, `no-gate` — never reaches step 7 (task.170, task.182).
+- any other `halt_reason`, or a PreCompact `pause_reason`, or **any `develop-bug` snapshot** → run
+  `advance-pipeline-lock.sh --restore {doc-directory}` **here**, before Phase 0b, on the
+  re-invocation path exactly as the in-session continuation does (QA cycle 2, CR-2; the step-0
+  doc's Shared Resume Logic states the call).
+
+<!-- restore: in-place --> **On the in-place path the same bullets decide, read from disk.** A
+session that continues in place after a pause or a HALT has no detector run and no Resume prompt,
+so the `source` and "chooses Resume" above do not exist for it. Evaluate the bullets from the
+candidate on disk instead: the halt snapshot's own `halt_reason` (or its `pause_reason`), its `halt_step`, and
+the pipeline named by its `skill`. An orphaned `.lock.pausing.<pid>` claim carries neither
+reason and takes the last bullet. When nothing is on disk, there is nothing to restore
+(task.133 QA-4).
+
+A numeric advance with no lock is an error, so a resume that skips whichever of these applies
+fails at its first transition.
+
+### Narrow Phase 0b Scope
+
+Pass `recommended_step` to Phase 0b. Phase 0b only verifies artifacts for steps **up to `recommended_step - 1`** (i.e., steps the detector considers completed). Steps at or after `recommended_step` are treated as ⏳ Pending.
+
+---
+
+### Persisted up-front answers (task.201)
+
+Step 1 writes §0d's resolved answers into the lock (`answers`, `answer_sources`, `waiver`), and §0d's
+answer resolution reads them back through `--persisted-file`, so a resume asks nothing they settle.
+The states the rule holds in, each pinned by a test:
+
+| State | What §0d does | Test |
+| --- | --- | --- |
+| Live lock carrying `answers` | Reuses them (source `persisted`); asks nothing they settle | `pipeline-answers.test.mjs` 7a |
+| Lock rebuilt by `--restore` from a halt snapshot or an orphaned claim | Same — `--restore` deletes only the halt/pause fields and `waiting_on`, so `answers` survives | `advance-pipeline-lock.test.sh` scenario 13 |
+| Legacy lock or snapshot with no `answers` (written before task.201) | Today's rule: questions already in the Decisions Log are not re-asked | `pipeline-answers.test.mjs` 7b |
+| No lock and no snapshot (re-invocation over an existing report) | As the legacy row | `pipeline-answers.test.mjs` 9b |
+| Re-invocation flags that disagree with the persisted answers | A conflict: asked, with both values stated — never silently overwritten either way | `pipeline-answers.test.mjs` 7c |
+| A persisted answer the epic now contradicts | Asked, with the conflict stated | `pipeline-answers.test.mjs` 7d |
+
+## Phase 0b — Resume Artifact Verification (CRITICAL)
+
+### Working-tree probe — before any artifact is trusted (task.124, obs #85)
+
+A resume inherits whatever the working tree holds, and the pipeline's own steps assume a clean
+tree: Step 3's `/develop` commits with `git add -u`, Step 8's `/commit-changes --scope` sweeps the
+work-item directory, and every `✅` verification below reads files that an uncommitted overlay may
+have rewritten. On task.116 a resume inherited a dirty tree unseen and an overlay reverted every
+bundled copy the run had produced. So the probe runs **first**, and it **classifies every
+`git status --porcelain` entry before acting, and acts only on the classified paths**:
+
+| Class | What it is | Action |
+| --- | --- | --- |
+| **(a) overlay** | every entry is byte-identical to the base branch — a tracked file whose content equals `$BASE_REF`'s, or an untracked file the base **has** with the same bytes (a stray checkout/copy, not work) | discard, path by path, **from `HEAD` into both the index and the working tree**: `git checkout HEAD -- <tracked paths>`, `git clean -f -- <untracked paths>`; then re-read the **full** `git status --porcelain --no-renames` and HALT if anything remains; list every discarded path in the Decisions Log |
+| **(b) bundle drift** | every entry is under `skills/*/references/` — bundled copies out of date with their sources | `npm run bundle -- --check \|\| npm run bundle`, then continue |
+| **(c) anything else** | an entry the probe cannot classify — real uncommitted work, an untracked file the base does not have, a mix; and an **unbindable base** (no PR, no report row, no `**Branch model:**` line), which makes the whole tree (c) | **HALT**: print the entries and stop. A resume that guesses here is the task.116 overlay again |
+
+**Set aside before classifying: the 5c carried set** (task.173). It is the work item's PR review
+report and the doc-only fixes 5c staged for `/finalise` 6a to carry. A path-limited pause commit
+leaves them staged on purpose. An entry staged `A` or `M` with nothing unstaged on top, that is either
+the work item's `*.pr-review.*.md` or a path listed in `.claude/state/5c-carry-eligible.txt`, is
+printed, then kept out of (a), (b) and (c). The list counts only when its header line names this
+work item's review report and that report is staged. (a) must never discard it, and (c) must not HALT on what
+a resume into Step 7 is meant to carry.
+
+```bash
+# `--no-renames`: a staged rename would otherwise print as one `R  old -> new` entry whose
+# "path" is the whole arrow expression — a pathspec that matches nothing, is quiet under `git
+# diff`, and is "discarded" without effect (task.124 QA cycle 2, CR-4). Split, it is a `D` and
+# an `A`, each a real path; the `A` is not in the base and so is class (c).
+DIRTY=$(git status --porcelain --no-renames)
+# The 5c carried set (task.173) is resumable state, not dirt: the PR review report and the doc-only
+# fixes 5c staged for /finalise 6a to carry, with nothing unstaged on top. The path-limited pause
+# commit leaves it staged, so set it aside BEFORE classifying — (a) must never discard it and (c)
+# must not HALT on it. An entry qualifies only with index column A or M, a clean worktree column,
+# and a path that is the work item's own PR review report or one the 5c classify block cleared.
+WI_DIR=$(dirname "{implementation-report-path}")
+# The eligible list counts only when its header names this work item's review report and that
+# report is itself staged; a list left by another work item or an earlier pass is ignored (task.173 QA-3).
+ELIGIBLE=""
+ELIG_HEAD=$(head -1 .claude/state/5c-carry-eligible.txt 2>/dev/null)
+case "$ELIG_HEAD" in
+  "# review: $WI_DIR"/*.pr-review.*.md)
+    [ -n "$(git --literal-pathspecs diff --cached --name-only -- "${ELIG_HEAD#\# review: }")" ] && ELIGIBLE=.claude/state/5c-carry-eligible.txt ;;
+esac
+# How git spells each listed path in $DIRTY: ask git, with the same flags, rather than compare a raw
+# list entry against a status line — porcelain C-quotes a path with a space or non-ASCII byte, and
+# the list holds it raw, so a carried `docs/my notes.md` never matched (task.173 QA-9, CR9-2).
+CARRY_EXPECT=""
+if [ -n "$ELIGIBLE" ]; then
+  while IFS= read -r e; do
+    case "$e" in '# '*|'') continue ;; esac
+    CARRY_EXPECT="$CARRY_EXPECT$(git --literal-pathspecs status --porcelain --no-renames -- "$e")"$'\n'
+  done < "$ELIGIBLE"
+fi
+CARRY_LINES=""; REST_LINES=""
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  st=${line:0:2}; p=${line:3}
+  case "$st" in
+    "A "|"M ")
+      case "$p" in "$WI_DIR"/*.pr-review.*.md) CARRY_LINES="$CARRY_LINES$line"$'\n'; continue ;; esac
+      if [ -n "$ELIGIBLE" ] && printf '%s' "$CARRY_EXPECT" | grep -qxF -- "$line"; then
+        CARRY_LINES="$CARRY_LINES$line"$'\n'; continue
+      fi ;;
+  esac
+  REST_LINES="$REST_LINES$line"$'\n'
+done <<< "$DIRTY"
+[ -z "$CARRY_LINES" ] || { echo "5c carried set kept staged for 6a:"; printf '%s' "$CARRY_LINES"; }
+DIRTY=$(printf '%s' "$REST_LINES")
+if [ -n "$DIRTY" ]; then
+  # The base is RECORDED STATE, never a bare shell variable with a `develop` default: nothing in
+  # any pipeline binds BASE_BRANCH, so `${BASE_BRANCH:-develop}` probed every hotfix off `main`
+  # and every epic-integration branch against develop — and the one outcome that deletes bytes,
+  # the (a) discard, keyed on that comparison (task.124 QA cycle 5, CR-2). Order: the PR's own
+  # base when the branch has one (Steps 4+); else the Q1 answer in the report's Pipeline
+  # Configuration row (Steps 1–3); else the bug-variant report's `**Branch model:**` line; else
+  # HALT — a base the probe cannot bind is a base it must not guess, because the guess is what
+  # the (a) discard compares against (task.130, PR #436 review CR-1).
+  GH_ERR=$(mktemp); BASE_BRANCH=$(gh pr view --json baseRefName -q .baseRefName 2>"$GH_ERR"); GH_RC=$?
+  [ -n "$BASE_BRANCH" ] || BASE_BRANCH=$(sed -nE 's/^\| *Feature branch base *\| *`?([^ |`]+).*/\1/p' \
+    {implementation-report-path} 2>/dev/null | head -1)
+  # The BUG-variant report records the base on one line, not in a table row
+  # (implementation-report-template.md § Bug variant) — PR #436 review CR-1.
+  [ -n "$BASE_BRANCH" ] || BASE_BRANCH=$(sed -nE 's/^\*\*Branch model:\*\*.*\(base: *`?([^,) `]+).*/\1/p' \
+    {implementation-report-path} 2>/dev/null | head -1)
+  if [ -z "$BASE_BRANCH" ]; then
+    # Label the cause on stderr: a failed `gh` and a branch with no PR are different findings —
+    # and `gh pr view` exits 1 for BOTH, so the split reads its stderr, not only its status.
+    if [ "$GH_RC" -ne 0 ] && ! grep -qi 'no pull requests found' "$GH_ERR"; then
+      echo "probe: gh pr view failed: $(head -1 "$GH_ERR")" >&2
+    else
+      echo "probe: no PR on this branch" >&2
+    fi
+    echo "HALT: cannot bind the probe base — no PR, and {implementation-report-path} carries neither a '| Feature branch base |' row nor a '**Branch model:** … (base: X' line; add the row and re-invoke. Nothing was discarded."
+    echo "dirty entries (unclassified — the whole tree is (c) until the base binds):"; printf '%s\n' "$DIRTY" | head -20
+    rm -f "$GH_ERR"; exit 1
+  fi
+  rm -f "$GH_ERR"; BASE_REF="origin/$BASE_BRANCH"
+  # Classify EVERY entry first; act only on the classified paths (never `checkout -- .`, never a
+  # directory-wide `clean`). `git diff <commit> -- <path>` does not see an untracked path, so `??`
+  # entries need their own test: base must HAVE the path and the bytes must match.
+  TRACKED=(); UNTRACKED=(); OVERLAY=true
+  while IFS= read -r line; do
+    st=${line:0:2}; p=${line:3}
+    # A quoted path (a space, a tab, a non-ASCII byte) is printed with its C-style escapes; the
+    # probe does not unescape, so it cannot address the file — class (c), never (a).
+    case "$p" in \"*) OVERLAY=false; break ;; esac
+    if [ "$st" = "??" ]; then
+      if git cat-file -e "$BASE_REF:$p" 2>/dev/null && git show "$BASE_REF:$p" | cmp -s - "$p"; then
+        UNTRACKED+=("$p")
+      else OVERLAY=false; break; fi
+    else
+      # The base must HAVE the path: `git diff --quiet` is 0 for a path absent on BOTH sides, so
+      # an uncommitted deletion of a file the branch added would otherwise read as "identical
+      # to base" and the discard would re-create it (task.124 QA cycle 3, CR-2).
+      if git cat-file -e "$BASE_REF:$p" 2>/dev/null && git diff --quiet "$BASE_REF" -- "$p" 2>/dev/null; then TRACKED+=("$p"); else OVERLAY=false; break; fi
+    fi
+  done <<< "$DIRTY"
+  if [ "$OVERLAY" = true ]; then
+    # `git checkout HEAD -- <paths>`, never `git checkout -- <paths>`: the bare form restores the
+    # WORKING TREE FROM THE INDEX, and a staged overlay (`M ` in the first porcelain column) is
+    # in the index — the checkout is a no-op, the entry survives, and the success line below
+    # would be printed over nothing discarded (task.124 QA cycle 1, CR-4). Naming HEAD restores
+    # index and worktree alike from the branch's own committed state.
+    [ ${#TRACKED[@]} -gt 0 ]   && git checkout HEAD -- "${TRACKED[@]}"
+    [ ${#UNTRACKED[@]} -gt 0 ] && git clean -f -- "${UNTRACKED[@]}"
+    # Re-read the WHOLE tree, not the discarded pathspecs: every entry was classified (a), so
+    # after the discard the porcelain must be empty, and a pathspec-filtered re-read would be
+    # satisfied vacuously by the very entry a bad pathspec never addressed (QA cycle 2, CR-4).
+    # A discard that succeeded and left anything behind is the failure the probe exists to
+    # stop, so it is a HALT, not a warning.
+    # Minus the carried set, which was set aside above and is still staged by design.
+    LEFT=$(git status --porcelain --no-renames | grep -vxF -f <(printf '%s' "$CARRY_LINES") || true)
+    if [ -n "$LEFT" ]; then
+      echo "HALT: overlay discard left entries behind — classify by hand before resuming:"; printf '%s\n' "$LEFT"; exit 1
+    fi
+    echo "overlay discarded: ${#TRACKED[@]} tracked, ${#UNTRACKED[@]} untracked paths (porcelain re-read: clean)"   # list every path in the Decisions Log
+  elif ! printf '%s\n' "$DIRTY" | grep -qv 'skills/[^/]*/references/'; then
+    npm run bundle -- --check || npm run bundle
+  else
+    echo "HALT: dirty tree on resume — classify by hand before resuming:"; printf '%s\n' "$DIRTY" | head -20; exit 1
+  fi
+fi
+```
+
+**Why (a) is path-scoped, why `??` has its own test, and why the discard names `HEAD`.**
+`git checkout -- .` and a directory-wide `git clean` cannot tell "the overlay" from "the work this
+step authored" — both succeed, both report success, and `git status` afterwards shows *less* work
+rather than broken work (the step-3 doc's "Never revert or clean by directory" rule, obs #38).
+`git diff --quiet $BASE_REF -- <path>` **never reports an untracked path**, so the tracked-file
+test alone passes every `??` entry as "identical to base" and `git clean` then deletes a file the
+base never had. The `cat-file -e` + `cmp` pair is what makes an untracked file identical-to-base
+*provably* so; anything else is (c). The tracked arm needs the same `cat-file -e` precondition,
+because `git diff --quiet` is also silent for a path absent on both sides — an uncommitted deletion
+of a branch-added file (cycle 3 CR-2). And `git checkout -- <path>` restores the working tree **from
+the index**, so a *staged* overlay survives it — the discard names `HEAD` and re-reads the **whole**
+porcelain afterwards (a pathspec-filtered re-read is satisfied vacuously by an entry whose path the
+probe mis-parsed), because a probe that prints "discarded" over an entry it did not discard is the
+task.116 failure with a success line in front of it (cycle 1 CR-4, cycle 2 CR-4). Renames are
+split by `--no-renames` and a quoted path is (c) for the same reason: the probe acts only on paths
+it can address. Cost: one `gh pr view` (or up to two `sed` passes over the report) to bind the base — an
+unbindable base is a HALT before any entry is classified, never a `develop` guess — one `git
+status --porcelain --no-renames`, plus one `git cat-file -e` and one
+`git diff --quiet` (tracked) or `git show | cmp` (untracked) per entry for (a), plus one full
+porcelain re-read.
+
+**Halt snapshot for another document.** When Phase 0a's detector reports a `last-halt.json` whose
+`task_or_story_directory` is not this document's, it is **refused, not resumed** — and when a
+snapshot for *this* document names a `pr_url` that is `MERGED`, the detector reports it as
+`stale-snapshot` and **the orchestrator deletes it** (§ Consume Output, verified on disk) rather
+than offering a resume of merged work (obs #88; the detector prompt's Step 1; task.130). A document that reads `status: accepted` is **not** evidence the run
+finished — `/finalise` writes it before its second CI reading and before Step 8 — so an accepted
+document with an unmerged PR keeps its snapshot (task.124 QA cycle 2, CR-1). A completed run also deletes its own snapshot at Step 8, so a snapshot
+that reaches this point is either this run's live one or a leftover the detector names.
+
+**Restoring the lock — on either resume path.** The PreCompact hook and every terminal HALT
+**remove the lock** and leave a superset of it behind (`last-halt.json`, or an orphaned
+`.lock.pausing.<pid>` claim). Step 1 is the lock's only ordinary writer and *every* resume skips
+it — a session that continues in place after a pause **and** a re-invocation that chooses Resume
+in Phase 0b — so neither has a step that puts the lock back unless it is stated, and
+`advance-pipeline-lock.sh <n>` with no lock is now an **error naming the fix**, not a silent no-op
+(obs #123; QA cycle 2, CR-2). Who restores, and when, is stated once — under Phase 0a,
+**Restore the lock (both resume paths)** — and this paragraph only points at it (task.130;
+obs #132: five restatements of that rule produced bugs 9 → 11 → 12 → 13, each fixed at one site
+while the others stayed wrong). When **Restore the lock (both resume paths)** says the command runs here — and only then — run:
+
+```bash
+bash .agents/skills/{develop-story|develop-task|develop-bug}/references/advance-pipeline-lock.sh --restore {doc-directory}
+```
+
+It rebuilds the lock from the newest candidate for this document, strips the halt/pause fields and
+any `waiting_on`, keeps `current_step` at the halted step, and **consumes** the candidates. `grant-qa-cycles.sh`'s own
+restore (task.123) is this same call — one restore path, one document-match rule, one consumption
+policy (the resume contract's **Re-entry after a QA loop escalation**, below, is unchanged from the
+caller's side).
+
+### Artifact verification
+
+**Scope**: Verify only steps **up to `recommended_step - 1`** (as determined by Phase 0a). Steps at or after `recommended_step` are ⏳ Pending — do not verify. If Phase 0a failed validation, fall back to verifying all steps using `current_step` from the lock as the upper bound.
+
+For each step marked ✅ in the implementation report (within the Phase 0a scope), verify the expected artifact exists. If verification fails, **do not skip the step** — re-run it and log: "Resume verification failed for Step {N} — artifact missing, re-running."
+
+A step marked `⏸️ Paused` (set by the PreCompact hook on graceful pause) is treated identically to `⏳ Pending`: re-run from the start of that step. Earlier `✅` steps still skip per their artifact verification. Log: "Resuming after graceful pause — re-running Step {N}."
+
+Step 2 does not require artifact verification beyond reading the implementation report. **Step 8 is decided by the resume record, never by its row or by git**: its row is written `✅` before its commit, and the PreCompact hook commits and pushes the report, so neither can tell a paused Step 8 from a finished one (step-8 doc § Final Implementation Report Update is the one statement of why). **When the resume record is at step 8, the Step 8 row is not evidence.** The record is the lock's `current_step` (whether it survived or was restored by `--restore`), the halt snapshot's `halt_step`, or the orphaned claim's `current_step`. At 8, resume from the first row that is not finished. Rows 1–7 read as usual, and an unfinished Step 7 row still wins, because `/finalise` moves the lock to 8 as its last action, before the orchestrator finishes Step 7's tail (for develop-story and develop-task: the DoD body to the PR, the tracker update, the Step 7 checklist; for develop-bug: Part B's bug-close routine in `develop-bug-step-7-close-bug.md` — the Resolution Summary, status `closed`, the parent or registry linkage and the tracker-close check — then the Step 7 Completion Checklist). If rows 1–7 are all finished, re-run Step 8 from the start, whatever its row reads; the detector recommends 8 for a record at step 8. The record covers all of Step 8, because the lock outlives the Step 8 commit and only the Completion Checklist's `--complete` removes it (task 161). Log: "Resume at step 8 — re-running Step 8 (the resume record, not the row, decides)."
+
+### Subagent Summary Replay
+
+For ✅ steps whose `Subagent summary ref` column points to a `.summaries/step-<N>-*.json` file, prefer reading the JSON summary over re-running the subagent or re-reading the source artifacts the subagent consumed. This is the resume-side counterpart to the on-disk persistence convention in `references/subagent-summary-artifact.md`. If the JSON file is absent (in-flight pipeline started before the convention existed) or fails `jq -e '.schema_version == 1'`, fall back to the implementation report's textual notes for that step. Do NOT re-dispatch the subagent on resume just to repopulate the summary — the step is already ✅ and re-running is wasted work.
+
+### develop-story artifact table
+
+| Step | Artifact to verify | Verification command |
+| ---- | ------------------ | -------------------- |
+| 1. create-branch | Branch exists in git | `git branch --list "feature/story.{epic}.{story}.*"` returns the branch |
+| 3. develop | All tasks complete | Story file `Status:` field reads `Ready for Review` |
+| 4. create-pr | PR exists | `gh pr view {PR-number} --json state` returns open or merged |
+| 5–6. qa loop | **Both** `story.{epic}.{story}.qa.{N}.*.md` **and** `story.{epic}.{story}.gate.{N}.*.yml` exist **and** PR comment posted. **Conditional — the 5c check reads the implementation report, not the filesystem**: when the latest gate **reached 5c** — read mechanically from the same entry this check already opens: the highest `### QA Cycle {N}` entry's `**Action**` row reads `Proceeding to 5c` (5a writes it on every one of §5c's five accepting routes; do not re-derive the set from the gate's token or queue) — that entry's `**PR Review**` row must hold a **terminal verdict** — `APPROVE` or `CONCERNS`. Any other value (`pending — 5c not yet run`, `REQUEST CHANGES`, `review failed`, `not reached`, blank, or a missing row) means 5c did not clear, and Step 5–6 is **not** complete. A mid-loop resume on a gate that routed to 5b (its entry's `**Action**` row reads `Running qa-fix`) legitimately has no terminal verdict. **A terminal verdict that predates a QA re-entry does not count** — the **Second precedence** under QA Cycle Count Reconstruction decides when (`qa_reentry`); while it applies, Step 5–6 is **not** complete (task.170). | `ls {story-directory}/story.*.qa.*.md` AND `ls {story-directory}/story.*.gate.*.yml` AND `gh pr view {PR} --comments --json comments \| grep -i "QA"` — gate alone is insufficient. Then the 5c check, which is a **read of the implementation report** performed by the resume detector, not a shell command: take the last `### QA Cycle` entry and read its `**PR Review**` row. |
+| 7. finalise | **All three**: `story.{epic}.{story}.dod.{N}.*.md` exists **and** story `status:` reads `accepted` **and** finalise acceptance comment posted to PR | `ls {story-directory}/story.*.dod.*.md` AND `grep -iE "^status:\s*accepted" {story-file}` AND `gh pr view {PR} --comments --json comments \| grep -i "accepted"` |
+
+### develop-task artifact table
+
+| Step | Artifact to verify | Verification command |
+|------|-------------------|---------------------|
+| 1. create-branch | Branch exists in git | `git branch --list "feature/task.{id}.*"` returns the branch |
+| 3. develop | All phases complete | Task file `Status:` field reads `Ready for Review` |
+| 4. create-pr | PR exists | `gh pr view {PR-number} --json state` returns open or merged |
+| 5–6. qa loop | **Both** `task.{id}.qa.{N}.*.md` **and** `task.{id}.gate.{N}.*.yml` exist **and** PR comment posted. **Conditional — the 5c check reads the implementation report, not the filesystem**: when the latest gate **reached 5c** — read mechanically from the same entry this check already opens: the highest `### QA Cycle {N}` entry's `**Action**` row reads `Proceeding to 5c` (5a writes it on every one of §5c's five accepting routes; do not re-derive the set from the gate's token or queue) — that entry's `**PR Review**` row must hold a **terminal verdict** — `APPROVE` or `CONCERNS`. Any other value (`pending — 5c not yet run`, `REQUEST CHANGES`, `review failed`, `not reached`, blank, or a missing row) means 5c did not clear, and Step 5–6 is **not** complete. A mid-loop resume on a gate that routed to 5b (its entry's `**Action**` row reads `Running qa-fix`) legitimately has no terminal verdict. **A terminal verdict that predates a QA re-entry does not count** — the **Second precedence** under QA Cycle Count Reconstruction decides when (`qa_reentry`); while it applies, Step 5–6 is **not** complete (task.170). | `ls {task-directory}/task.*.qa.*.md` AND `ls {task-directory}/task.*.gate.*.yml` AND `gh pr view {PR} --comments --json comments \| grep -i "QA"` — gate alone is insufficient. Then the 5c check, which is a **read of the implementation report** performed by the resume detector, not a shell command: take the last `### QA Cycle` entry and read its `**PR Review**` row. |
+| 7. finalise | **All three**: `task.{id}.dod.{N}.*.md` exists **and** task `status:` reads `accepted` **and** finalise acceptance comment posted to PR | `ls {task-directory}/task.{id}.dod.*.md` AND `grep -iE "^status:\s*accepted" {task-file}` AND `gh pr view {PR} --comments --json comments \| grep -i "accepted"` |
+
+## Plan Freshness (Step 3 Prerequisite)
+
+If the Decisions Log records a plan file from a prior session and Step 3 is being resumed, verify the plan file is at least as fresh as the story/task file:
+
+```bash
+# develop-story (macOS/Linux portable):
+_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+plan=$(find {story-directory} -maxdepth 1 -name "story.{epic}.{story}.plan.*.md" 2>/dev/null | head -1)
+[ -n "$plan" ] && [ "$(_mtime "$plan")" -ge "$(_mtime {story-file})" ]
+
+# develop-task (macOS/Linux portable):
+plan=$(find {task-directory} -maxdepth 1 -name "task.{id}.plan.*.md" 2>/dev/null | head -1)
+[ -n "$plan" ] && [ "$(_mtime "$plan")" -ge "$(_mtime {task-file})" ]
+```
+
+If the plan is stale (older than the story/task file), do **not** reuse it — drop the cached "Pre-develop surface map:" entry from the in-memory resume context, re-run the Explore subagent, and re-discover the plan file. Log: "Plan file stale on resume (mtime < story/task mtime) — re-running pre-develop discovery." Cap re-discovery at **1 retry per resume** to prevent loops; if the plan is still stale after the retry, proceed with the latest plan and log a warning. If no plan file exists in the directory, the freshness check is a no-op.
+
+## Gate File Conflation Warning (CRITICAL)
+
+A `gate.yml` written manually (without running the QA skill) does NOT satisfy Step 5–6. The required artifacts are the `qa.N.md` report file (created by `/qa-story` or `/qa-task`) AND the `gate.N.yml`. Similarly, updating DoD checkboxes in the story/task doc does NOT satisfy Step 7 — `/finalise` must write a separate `dod.N.md` file AND post an acceptance comment to the PR.
+
+## QA Cycle Count Reconstruction (if resuming at Step 5–6)
+
+> **Resume inside 5c re-enters at 5c, not 5a.** The `### QA Cycle {N}` heading is written at 5a as
+> soon as the gate is read, so a run killed *inside* 5c already has N headings and naive
+> reconstruction would set `NEXT_CYCLE=N+1` and re-run the whole QA review against an unchanged tree
+> — burning a cycle to re-derive the gate that just passed. Detect the 5c sub-state instead: read the
+> highest `### QA Cycle {N}` entry's `**PR Review**` row — **after** its `**Action**` row. **Precedence:
+> an `**Action**` that begins `Escalating —` wins over every PR Review value**, because a run that
+> left the loop through Loop Escalation has no cycle to re-enter whatever its last verdict was
+> (a loop-limit-via-review entry carries a real `REQUEST CHANGES` *and* the escalation Action —
+> task.123 QA cycle 4, CR-3). **Second precedence — a QA re-entry after a finalise DoD-gaps halt
+> (task.170):** when the lock or halt snapshot carries `qa_reentry` and the report — counted after
+> the reconstruction below back-fills an entry for every gate without one — holds no more
+> `### QA Cycle` headings than `qa_reentry.report_entries`, its last entry's terminal `APPROVE` /
+> `CONCERNS` is the run that halted at Step 7 — no re-entered cycle has written a gate or an entry
+> yet. Do not go to Step 7: re-enter at **5a**; the cycle number comes from the gates on disk, as on
+> any resume. A gate the re-entered cycle wrote before it could write its entry is no exception to
+> anything: the reconstruction back-fills its entry, the count passes `report_entries`, and the run
+> continues from that gate, which did read the re-entered head (QA cycle 5, CR-2). It keys on a
+> **count of report headings**: 5a writes the entry only after it reads the gate, so a rule keyed on
+> the gate cleared one step early (task.170 QA cycle 3, CR-1), and entries are gate-numbered while
+> the report can run ahead of or behind the gates, so a rule keyed on an entry number could fail to
+> clear (QA cycle 4, CR-3); and on the **back-filled** count, because `report_entries` is recorded as
+> `max(highest gate, headings)` — the count the back-fill produces — so the back-fill alone cannot
+> pass it (QA cycle 5, CR-1). The re-entered cycle always adds exactly one gate and one heading. It clears itself
+> once that heading exists, so it never fires on a later cycle. This paragraph is the rule's one
+> statement; the 5–6 artifact rows cite it.
+> Only when neither precedence applies does the PR Review row select a row below. Exactly one row
+> matches any entry.
+>
+> | `**PR Review**` reads | Resume action |
+> | --- | --- |
+> | `APPROVE` or `CONCERNS` | 5c cleared — Step 5–6 is complete, go to Step 7 |
+> | `REQUEST CHANGES` (an `**Action**` of `Proceeding to 5c` or `Running qa-fix`) | 5c ran and routed back — set the counter to `N`, re-enter at **5b** |
+> | `review failed` | 5c could not run (usually the PR state). Set the counter to `N` and re-enter at **5c** — **once**. Its usual cause is not self-healing, so an unattended driver would otherwise re-run `/review-pr`, HALT, and repeat forever. On a **second consecutive** `review failed` for the same cycle `N`, do not re-enter: escalate to Loop Escalation with the review's own error text. |
+> | `pending — 5c not yet run` | 5a wrote its placeholder on a gate that routed to 5c and the run died before 5c overwrote it. **Same action as `not reached`**: if the entry's `**Action**` row reads `Proceeding to 5c` (gate `{N}` reached 5c by any of §5c's five routes), re-enter at **5c**; otherwise at **5a**. This is the narrowest window in the loop — it opens when 5a writes the `### QA Cycle {N}` entry and closes when 5c records its verdict — and it is the value the artifact tables above will actually be reading on a run killed inside it |
+> | `not reached`, blank, or no row (an `**Action**` of `Running qa-fix` or `Proceeding to 5c`) | The gate did not exit the loop, or the run died before 5c. If the entry's `**Action**` row reads `Proceeding to 5c` (same signal as the row above), re-enter at **5c**; otherwise at **5a**. One exception: when the `**Action**` reads `Running qa-fix`, the cycle's gate `{N}` exists, and its `head:` is an ancestor of `HEAD` with nothing outside the work item's directory changed since (`git diff --name-only <head> HEAD`), the pause fell between the gate and qa-fix and the gate is still valid for the tree — set the counter to `N` and re-enter at **5b**, not 5a. Re-running 5a there re-derives a gate nothing has invalidated |
+> | an `**Action**` of `Escalating — loop not converging` or `Escalating — loop limit reached` (whatever the PR Review row says) | The run **left the loop through Loop Escalation**; there is no cycle to re-enter. Do not re-enter at 5a. Apply **Re-entry after a QA loop escalation** (below): reconstruct from disk, back-fill, and offer the grant — or, if the halt snapshot's `halt_reason` is neither `loop-limit` nor `not-converging`, surface the mismatch to the user rather than resuming |
+>
+> **Why this reads the report rather than the filesystem.** An earlier version of this check compared
+> `gate.{N}` against `pr-review.{n}` on disk. That was wrong twice over — the two indices count
+> different things (`gate` per QA cycle, `pr-review` per 5c *invocation*, and 5c runs only on a gate in
+> the accepting-route set), and the shell predicate implementing it returned a **false PASS under zsh** when its glob
+> matched nothing, verifying a run with no artifacts at all as complete. Three consecutive QA cycles
+> failed to state that predicate correctly, which is this repo's signal to replace the mechanism
+> rather than correct it again. The `**PR Review**` row is written every cycle by contract, it is
+> already the row this section reads for cycle reconstruction, and it carries the verdict directly —
+> so no index arithmetic, no globs, and no shell portability surface.
+
+If the last completed step was within the QA loop, reconstruct the cycle count **from the gates on
+disk**, and use the `### QA Cycle` entries in the implementation report as the cross-check:
+
+```bash
+# The gate is what a QA run leaves behind whether or not it ran inside this pipeline. The cycle
+# comes from the ONE definition the QA skills use (task.158): a zero-padded `gate.02` is 2.
+# The helper's rc 1 also means "no such directory" — checked first, so a mis-substituted
+# {doc-directory} halts instead of reading as a fresh start (task.158 QA cycle 1, CR-2).
+[ -d "{doc-directory}" ] || { echo "HALT: {doc-directory} is not a directory — cannot reconstruct the QA cycle" >&2; exit 1; }
+QA_CYCLE=$(bash .agents/skills/{develop-story|develop-task|develop-bug}/references/qa-cycle.sh "{doc-directory}" 2>/dev/null); rc=$?
+# rc 1 = no numbered gate. Anything else is a broken invocation: HALT.
+[ "$rc" -le 1 ] || { echo "HALT: qa-cycle.sh not runnable (rc=$rc) — cannot reconstruct the QA cycle" >&2; exit 1; }
+# rc 1 is TWO states, and only one is a fresh start: no gate file at all (→ 0), or gate
+# files none of which carries a usable cycle number (unnumbered, gate.0, over 9 digits).
+# The second is a directory the helper cannot read — resuming it at cycle 1 would write a
+# gate.1 beside files nobody accounted for — so it halts (task.158 QA cycle 2, QA2-CR-1).
+# A count, not a selection: it only asks whether any gate file exists.
+if [ -z "$QA_CYCLE" ] && [ "$(find "{doc-directory}" -maxdepth 1 -name '*.gate.*.yml' 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]; then
+  echo "HALT: {doc-directory} holds gate files but none carries a usable cycle number — rename them (*.gate.{N}.{name}.yml) before resuming" >&2; exit 1
+fi
+QA_CYCLE=${QA_CYCLE:-0}
+COMPLETED=$(grep -c "^### QA Cycle" {implementation-report-path})
+CYCLES_OUTSIDE_LOOP=$((QA_CYCLE - COMPLETED))     # derived here, never stored — see below
+NEXT_CYCLE=$((QA_CYCLE + 1))
+```
+
+Set the cycle counter to `NEXT_CYCLE` (= highest gate + 1) before re-entering the loop. This is the cycle **about to be attempted**.
+
+Examples:
+- 0 gates → `NEXT_CYCLE=1` (fresh start, equivalent to non-resume)
+- `gate.2` highest, 2 entries → `NEXT_CYCLE=3` (cycles 1 + 2 complete, attempting 3 next)
+- `gate.5` highest, 5 entries → `NEXT_CYCLE=6` → exceeds `QA_MAX_CYCLES` → the **Re-entry** rule below decides between the grant and **Loop Escalation**
+- `gate.6` highest, 5 entries → `CYCLES_OUTSIDE_LOOP=1`: the operator ran a cycle by hand between halt and re-invocation — back-fill it (below), then `NEXT_CYCLE=7`
+- `gate.3` highest, 5 entries → `CYCLES_OUTSIDE_LOOP=-2`: the report claims two cycles that have **no gate on disk** (a gate never committed, or deleted). The cross-check has failed in the other direction — the report is the only record of those cycles. Do not back-fill and do not delete the entries: log `"⚠️ 2 QA Cycle entries have no gate on disk — resuming from the report's count"` in the Issues Log and set `NEXT_CYCLE = COMPLETED + 1`, the pre-task.123 rule, so a cycle is never re-run against a gate that no longer exists
+
+This convention ensures the cycle budget is respected across resumes.
+
+### Re-entry after a QA loop escalation
+
+> **The gap this closes (task.123, obs #95).** A standalone `/qa-task` or `/qa-story` run by the
+> operator after a loop-limit halt writes `gate.{N}` and `qa.{N}` to disk and **no `### QA Cycle`
+> entry** in the implementation report — the entry is the orchestrator's, and no orchestrator was
+> running. Counting report entries therefore under-counts by exactly the cycles the operator ran,
+> and a resumed pipeline re-runs a cycle that already happened. The halt snapshot cannot carry the
+> count either: it is written *at* the halt, before those cycles exist. So the count is
+> **reconstructed from disk at resume** and the report is brought up to it.
+
+1. **Reconstruct.** `QA_CYCLE` = the highest `{N}` over `gate.{N}.*.yml` on disk (the snippet
+   above). `CYCLES_OUTSIDE_LOOP = QA_CYCLE − COMPLETED` is **derived here and never stored** — it is
+   always `0` at halt time, so a snapshot field for it would only ever record nothing.
+2. **Back-fill.** For each `N` with a gate on disk but no `### QA Cycle N` entry, append a minimal
+   entry to QA Iteration History, in cycle order, so the Convergence check and the route classifier
+   read a complete sequence: the gate verdict, `**HIGH findings**` (the Convergence check's awk over
+   that gate), `**MEDIUM findings**` (`countRaised`), `**PR Review**: not reached — gate did not
+   exit the loop`, `**Loop exit**: n/a — this exit not taken`, `**Action**` from the gate's queue by
+   the Outcome branching's arms, and — directly under the heading — `**Origin**: run outside the
+   loop (operator)`. The back-filled entry is a record of a cycle that ran, not a claim that the
+   pipeline ran it.
+3. **Offer the grant.** When the halt snapshot's `halt_reason` matches `loop-limit|not-converging`,
+   Phase 0b's prompt — which lives in `skills/develop-task/SKILL.md` and `skills/develop-story/SKILL.md`,
+   not here — is the halt message's own three options plus **"Resume at 5a with {k} more cycles"**.
+   On accept, record the grant with **one call** to the bundled writer:
+
+   ```bash
+   bash .agents/skills/{develop-story|develop-task}/references/grant-qa-cycles.sh {doc-directory} {k} {implementation-report-path}
+   ```
+
+   Source: `references/grant-qa-cycles.sh`; suite: `grant-qa-cycles.test.sh`. Everything it
+   does was a defect when the prose left it to the caller (task.123 QA cycles 2 and 3):
+
+   - It **reconstructs the base** as `max(highest gate on disk, `### QA Cycle` entries in the
+     report)` — the same number step 1 resumes from on either of its paths — and never from a
+     `$QA_CYCLE` bound in a neighbouring fenced block, which does not exist in this one.
+   - It **restores the lock from the halt snapshot when no lock exists** — through
+     `advance-pipeline-lock.sh --restore`, the one restore path since task.124, which also
+     consumes the snapshot: a terminal HALT removes
+     the lock, and the only ordinary writer of it (the end of `/create-branch`) is a step a resume
+     skips, so without this the grant had no file to land on. The restore drops the snapshot's
+     halt-only fields (`halted_at`, `halt_reason`, `halt_step`) and PreCompact's (`paused_at`,
+     `pause_reason`) and keeps everything else, the snapshot being a superset of the lock. It
+     **refuses a snapshot for another document** — one whose `task_or_story_directory` is not
+     `{doc-directory}` — because a stale snapshot persists by design.
+   - It **never lowers** a `qa_max_cycles` the lock already carries.
+   - It **writes three fields atomically** — `extra_cycles_granted = k` (the record),
+     `qa_max_cycles = base + k` (the budget) and `qa_phase`, the re-entry point — via `mktemp` +
+     `mv`, removing its temp file on every failure, and prints the budget and `reenter_at` back from
+     the written lock. **The re-entry point depends on where the halt stopped** (obs #228) — which
+     value for which halt is the `qa_phase` row of the lock schema in `develop-pipeline-pause.md`.
+     The reason: a `loop-limit` halt ran its last 5b, so the next gate must read that fix, and a
+     `not-converging` halt fired at 5a *before* 5b, so the latest gate's queue must go to `/qa-fix`
+     first. Re-entering a not-converging halt at 5a reviews unchanged code,
+     re-raises the same HIGH and trips the check again, spending the grant with no fix attempted
+     (task.140). The script reads `halt_reason` from the candidate before its restore drops it, and
+     reads its leading token: the HALT appends detail after a `:` or a space, and an exact compare
+     sent every real not-converging halt to `5a` (obs #17).
+
+   The loop then runs with **`QA_MAX_CYCLES` = the lock's `qa_max_cycles`** (absent → 5). The
+   budget is **relative to the reconstructed count, not to 5**: a grant of `k` must deliver `k`
+   cycles from the point of re-entry, and every gate written since the original budget — a route-2c
+   half-cycle's `gate.6`, an operator's standalone cycle, a previous grant's cycles — has already
+   consumed cycle numbers that `5 + k` would count against the grant. On a halt at 5 with an
+   operator cycle 6 on disk, `k = 2` gives `qa_max_cycles = 8` and cycles 7–8 run; `5 + 2 = 7`
+   would have delivered one. It is written to the lock as an **absolute** number, rather than
+   recomputed from disk on every read, so a compaction pause and resume inside the granted run
+   does not creep the budget upward by re-adding `k` to a larger count. The names are
+   `extra_cycles_granted` and `qa_max_cycles` in the lock, the halt snapshot (a superset of the
+   lock), the writer script, the step-5-6 doc and both SKILL.md — one spelling each, and
+   `evals/shared/tests/qa-loop-lock-fields-parity.test.mjs` fails when any file disagrees. **Do not
+   reuse `MAX_ITER`**: that is the Step 3 develop-loop bound (below), a different budget over a
+   different loop.
+4. **Re-enter at the phase the grant printed (`reenter_at`).** `5a` → as cycle `NEXT_CYCLE`; 5a's
+   own first action (`set-qa-phase.sh 5a`) then runs as on any cycle and is a noop here. `5b` → run
+   5b on the latest gate as cycle `QA_CYCLE` (the cycle the halt interrupted), then 5a as
+   `NEXT_CYCLE`. **A declined grant, or a grant the script refused (exit 1 — surface its stderr line to the
+   user), does not re-enter the loop at all**: no lock is restored, no cycle runs, and the run
+   returns to the halt message's own three options. That is the one statement of the declined path;
+   the step-5-6 HALT messages and both SKILL.md Phase 0b blocks point here rather than restating it
+   (task.123 QA cycle 4, CR-2). A resume with `NEXT_CYCLE > QA_MAX_CYCLES` and no grant is the same
+   case — it is the halt, re-surfaced.
+
+The lock's `qa_phase` (`5a|5b|5c`, written by the loop as it moves) corroborates the 5c sub-state
+table above — a snapshot at `qa_phase: 5c` with `**PR Review**: pending` is the narrow window that
+table describes — but the `**PR Review**` row stays the source of truth, because it is written by
+contract on every cycle and `qa_phase` is absent on a lock from a run that predates it. **The convergence check
+also survives a resume**: it reads the per-cycle HIGH counts back out of the `### QA Cycle` entries
+in the implementation report (`**HIGH findings**: {n}`), so a resumed run at cycle 3 or later
+evaluates the same sequence a continuous run would. If an earlier cycle's entry has no HIGH count
+recorded (a run that predates the check), treat that cycle's count as unknown and do not trip the
+guard on it — the check needs three real readings. Mid-cycle resume (entry written but qa-fix not yet committed) is handled by re-running 5a — `/qa-story` / `/qa-task` is idempotent and will overwrite the same `qa.N.md` / `gate.N.yml` for the in-flight cycle.
+
+### Re-entry after a finalise DoD-gaps halt
+
+A `/finalise` run that finds Definition of Done gaps HALTs at Step 7, and its snapshot records
+`halt_step` 7. When the gaps are closed by **changing code**, a resume at 7 would accept a head no QA
+gate has read — on task.142 the operator's improvised QA cycle over such a fix found a medium defect
+(`task.142.gate.2`, CR-1). The lock helper is monotonic, and `advance-pipeline-lock.sh 5` on a step-7
+lock is a silent no-op, so the backward move has its own writer (task.170, observation #235):
+
+```bash
+bash .agents/skills/{develop-story|develop-task}/references/reenter-qa-after-finalise.sh {doc-directory} {implementation-report-path}
+```
+
+Source: `reenter-qa-after-finalise.sh` (this directory); suite: `reenter-qa-after-finalise.test.sh`.
+It is the **only** writer that may lower `current_step`, and only from 7 to 5. Every refusal runs
+**before** any write, so a refused re-entry restores nothing and consumes nothing. It refuses (exit 1,
+`reenter-qa: refused (<reason>)`) with exactly these reasons:
+
+<!-- reenter-qa-refusals: start -->
+Each reason carries its **route** — this list is that route's one statement; the halt-7 bullet above
+and both SKILL.md Phase 0b paragraphs cite it.
+
+- `lock-present` — a live lock exists; the run is already resumed. **Route:** continue the live run.
+- `no-snapshot` — `advance-pipeline-lock.sh --restore --which` chose no candidate for this document. **Route:** the resume's other paths (nothing to re-enter from).
+- `not-a-finalise-halt` — the snapshot's `halt_step` is not 7 (compared as text: the HALT snippet writes it with `jq --arg`). **Route:** the next bullet (an ordinary restore).
+- `no-dod` — no `{stem}.dod.{N}.*.md` beside the document, keyed on the work item's own stem — read from the DoD files whose stem the directory name continues, never from a bug's — so a co-located bug's DoD is never read as its verdict. **Route:** the next bullet.
+- `dod-not-gaps` — the newest DoD file does not read `**Final Status:** ❌ GAPS`. **Route:** the next bullet.
+- `no-gate` — `qa-cycle.sh` found no single current gate. Its own reason is relayed above the refusal as a `reenter-qa:` line — no gate file, gate files with no cycle number, or two files claiming one cycle (task.182). **Route:** back to the operator — resolve the gate files the relayed line names and run the script again; **never** step 7, which would accept a head no gate has read (a step-7 halt had a gate, so a missing or ambiguous one is a state to repair, not a document-only fix).
+- `git-unreadable` — `git status` exited non-zero, so the movement measure cannot run; git's own error is printed with it (task.182). **Route:** back to the operator — repair the repository and run the script again; **never** step 7, which an unread tree would otherwise reach through `no-code-moved`.
+- `uncommitted-fix` — a **tracked** change outside the work item's directory is uncommitted. **Route:** back to the operator — commit the fix and run the script again; **never** step 7, which would accept a head no review has read.
+- `no-code-moved` — no commit outside the work item's directory since the gate's `head:`: a document-only fix. **Route:** the next bullet — `/finalise` re-runs at 7. Untracked files outside the directory are named in this refusal, never a reason of their own: after Step 4 restores the files it held aside, nothing can tell one of those from a new fix file, so the operator who can decides — commit any that belong to the fix and run the script again.
+<!-- reenter-qa-refusals: end -->
+
+**Movement is measured as committed history**, because that is what the re-entered review reads
+(`qa-task` Step 3b scopes from commits and HALTs on an uncommitted tracked change): commits since the
+gate's `head:` outside the directory. Uncommitted tracked work is refused (`uncommitted-fix`); untracked
+files are named on every outcome and never counted (above). `.claude/state`, the pipeline's own
+scratch, is never counted; a `head:` that is absent, not
+40-hex, not a commit or not an ancestor of `HEAD` counts as moved. It fails toward one extra QA
+cycle, never toward an ungated head.
+
+On accept it restores through `advance-pipeline-lock.sh --restore` (which consumes the snapshot) and
+then writes, in one `mktemp` + `mv`: `current_step: 5`, `qa_phase: 5a`,
+`qa_max_cycles = max(existing, base + 2)` — `base` reconstructed as the grant reconstructs it
+(**Re-entry after a QA loop escalation**, step 3), `2` being the grant prompt's recommended `k` — and
+`qa_reentry: {from_step: 7, reason: "dod-gaps-code-fix", at, gate_head, report_entries}`, which explains a
+lowered step to a later reader and gives the **Second precedence** its `report_entries` (the report's
+`### QA Cycle` heading count at re-entry, as the back-fill leaves it: `max(highest gate, headings)` — the script therefore requires the report). A write that fails after the restore keeps the restored step-7 lock
+(the snapshot is gone, and a lock at 7 is resumable). The loop then runs from 5a, numbered from the gates;
+5c's APPROVE advances the lock `5 → 7` as on any run, and `/finalise` re-runs over a gated head.
+The Stop hook needs nothing new: a step-5 lock at `qa_phase: 5a` already names `/qa-task` /
+`/qa-story`. `develop-bug` has no re-entry — its verify loop does not use the step-5 lock shape.
+
+## Branch and PR Cross-Check
+
+Cross-check the recorded pipeline state against current reality before resuming:
+
+```bash
+# Verify branch still exists
+git branch --list "$(grep 'Branch:' {implementation-report} | awk '{print $2}')"
+# Verify PR still exists
+gh pr view "$(grep 'PR:' {implementation-report} | awk '{print $2}')" --json state 2>/dev/null
+```
+
+If the branch or PR no longer matches, warn the user before proceeding: "Pipeline state has diverged — recorded branch/PR may differ from current state. Proceeding anyway."
+
+## Develop Loop — Stall Semantics and MAX_ITER Bound
+
+> `MAX_ITER` bounds the **Step 3 develop loop** and nothing else. The QA loop's budget is
+> `QA_MAX_CYCLES` (step-5-6 doc, Loop Setup; the lock's `qa_max_cycles`, set by the grant above).
+
+Before iteration 1: dispatch an Explore subagent (read-only) to capture initial loop state, using the **shared loop-audit prompt** (`references/loop-audit-prompt.md`). Mark the wait on the lock beside the dispatch — `bash .agents/skills/{develop-story|develop-task}/references/set-waiting-on.sh "step-3 initial loop audit"` — and `… --clear` once its JSON is read (task.124; the Stop hook otherwise reads the yielded turn as a stall).
+
+Substitute: `<DOC_TYPE>` = `story` or `task` (per orchestrator); `<DOC_PATH>` = absolute story/task file path; `<TASKS_SECTION>` = `## Tasks` (story) or `## Implementation Plan` (task). Pass the resulting prompt verbatim.
+
+Failure semantics: this is the **initial audit** row in the shared prompt's "Caller Failure Semantics" table — JSON parse failure → retry once → inline shell fallback (`grep -cE '\[x\]'` + `grep -cE '\[[ x]\]'` + `git rev-parse HEAD`) and log `"Initial audit JSON failed — used inline fallback."`. Persistence: write `step-3-iteration-audit-0.json` per the shared prompt's "Persistence" table.
+
+Record: `INITIAL_COMPLETED = audit.completed` (or fallback), `M = audit.total` (or fallback), `LAST_COMMIT_HASH = audit.last_commit_hash` (or fallback). Set `ITER=1`, `MAX_ITER=5`, `LAST_COMPLETED=INITIAL_COMPLETED`.
+
+**Progress is made if EITHER `CURRENT_COMPLETED > LAST_COMPLETED` OR `CURRENT_COMMIT_HASH != LAST_COMMIT_HASH`** (a new commit on the branch counts as progress even if no checkbox ticked, e.g. when only subtask work or test fixes were committed).
+
+- **No progress** (both equal): HALT. Log: "Step 3 stall: /develop returned `In Progress` without ticking a checkbox or producing a new commit (iteration {ITER}, {CURRENT_COMPLETED}/{M})". Set report status to `Escalated` and HALT.
+- **`ITER >= MAX_ITER`**: iteration cap reached — HALT. Log: "Step 3 hit MAX_ITER={MAX_ITER} without reaching `Ready for Review` ({CURRENT_COMPLETED}/{M} ticks). Manual intervention required."
+- **Otherwise**: log "Step 3 iteration {ITER}: {CURRENT_COMPLETED}/{M} ticks complete (commit-progress: {yes/no}). Re-invoking /develop." Set `LAST_COMPLETED=CURRENT_COMPLETED`, `LAST_COMMIT_HASH=CURRENT_COMMIT_HASH`, increment `ITER`.

@@ -1,0 +1,323 @@
+---
+name: develop-pipeline-step-8-commit
+description: Step 8 (commit-changes + lock removal) shared by develop-story and develop-task. Covers final implementation report update (Finished timestamp, Final Status, QA Iterations, Completion Summary, and every Pipeline Progress row including Step 8's own, all before the commit), /commit-changes invocation, final push, and the Completion Checklist, which ends in the pipeline lock's one terminal removal (`--complete`). Nothing edits the report after the commit. Near-identical for both orchestrators — one variant noted for Completion Summary wording.
+---
+<!-- AUTO-GENERATED — DO NOT EDIT. Source: shared/resources/develop-pipeline-step-8-commit.md. Regenerate via `npm run bundle`. -->
+
+# Develop Pipeline — Step 8: Commit Changes
+
+## When This Document Applies
+
+Loaded by `/develop-story` and `/develop-task` during Step 8. Content is nearly identical for both orchestrators. The one variant (Completion Summary wording) is noted below.
+
+---
+
+## Final Implementation Report Update
+
+Before invoking `/commit-changes`, update the implementation report one final time:
+
+- Set **Finished** timestamp
+- Set **Final Status** to `Completed`
+- Fill in **QA Iterations** count
+- Ensure the Pipeline Progress table shows ✅ for all steps, **including Step 8's own row**, written `✅ Done` — the value the orchestrator's Step Transition Protocol writes after the step returns, so that later edit changes nothing. Fill Step 8's own `Completed (UTC)` cell here too (`date -u +%Y-%m-%dT%H:%MZ`, only when empty), for the same reason (task.201). Nothing in the report is edited after `/commit-changes`: check 5 of the Completion Checklist requires a clean tree, and check 4 requires every row finished. A late edit either fails check 5 or is left out of the commit, and 14 of the 123 committed completed reports carried Step 8's own row at `⏳ Pending` that way (task 160)
+- Write a **Completion Summary** paragraph:
+  - develop-story: what was **built**, QA iterations taken, notable decisions
+  - develop-task: what was **implemented**, QA iterations taken, notable decisions
+
+**The Step 8 row is written before the step's work, so it is not the evidence that Step 8 finished — and neither is the git state.** A PreCompact pause commits **and pushes** the report, so after one the row reads `✅` and the branch can look exactly like a finished run. The evidence is the **resume record**. This is the one statement of the rule; the resume contract cites it.
+
+- **What the record covers: all of Step 8.** The lock stays at `current_step` 8 from the start of Step 8 until its Completion Checklist passes. The checklist's last action is `advance-pipeline-lock.sh --complete`, which is the lock's one terminal remover. `/commit-changes`' lock cooperation (`advance-pipeline-lock.sh --skill commit-changes`) removes nothing at any step, so the lock survives the Step 8 commit, the push and Cleanup, and a failed check exits before `--complete` (task 161). The record reaches 8 slightly early: `/finalise` moves the lock to 8 as its last action, before the orchestrator finishes Step 7's tail. A lock (surviving or restored), halt snapshot or orphaned claim at step 8 for this work item therefore means Step 8's checklist had not passed, and possibly that Step 7's tail was unfinished. A resume from it goes back to the first unfinished row at or below Step 7, and otherwise re-runs Step 8 from the start, whatever the Step 8 row reads (resume contract, Phase 0b).
+- **Every Step 8 HALT is resumable.** The HALT rule commits the report through `/commit-changes`, then snapshots the lock. The lock is still there at step 8, so the snapshot records `halt_step: 8` like a HALT at any other step. Cleanup removes this run's halt snapshot only once the run reaches it.
+
+Re-running Step 8 is safe, but it is not a no-op. It writes a new **Finished** value, which costs one extra docs commit. It also leaves any `## Pipeline Paused` section the hook appended, which records the pause and is not rewritten. `/commit-changes` commits only what changed, the push is a no-op when nothing is new, and Cleanup and the Completion Checklist are idempotent.
+
+---
+
+## Lint the report before the terminal commit
+
+**Before** invoking `/commit-changes`, read the report back with the linter. This is call site **(4)** of the four the report-lint contract names (the other three: the Step Transition Protocol's post-Edit check, the HALT rule's pre-commit check, and the PreCompact hook). The Step 8 commit is the last writer of the report and the one every later reader trusts, and task.117's HALT commit shipped a report doubled and spliced mid-line because no boundary read it back (obs #115):
+
+```bash
+REPORT="${IMPLEMENTATION_REPORT:?must be set from lock or context}"
+command node .agents/skills/{develop-story|develop-task|develop-bug}/references/report-lint.js --file "$REPORT" --json; rc=$?
+case $rc in
+  0) ;;
+  1) echo "HALT: report failed lint — repair $REPORT by hand before committing (see the problems above)"; exit 1 ;;
+  2) echo "HALT: report-lint usage error (rc 2) — the call site is wrong, not the report; causes: develop-pipeline-step-8-commit.md § report-lint usage error"; exit 1 ;;
+  *) echo "HALT: report-lint.js not runnable (rc $rc) — check the bundled path"; exit 1 ;;
+esac
+```
+
+Engine: `references/report-lint.js`; expected sections come from `references/implementation-report-template.md`, the one definition. A `problems` result is a HALT with nothing committed; the linter never repairs. The exit is read into `rc` **before** the `case` — inside a `*)` arm `$?` no longer names the linter's status — and the three non-zero arms carry distinct messages because they name three different repairs: the report (1), the call site (2), the install (127 or anything else). A single `|| { HALT }` reported all three as "the report failed lint" (task.130; task.124 cycle-1 CR-7).
+
+**report-lint usage error (rc 2).** This is the one statement of the `2)` arm; every `2)` arm in the develop pipelines cites it and none restates it (task.130 gate 5 CR-6; task.133). `report-lint.js` exits 2 when it **refused its inputs and judged nothing**: a flag given no value (`needs a value`), an `unknown argument`, `--file is required`, `--variant must be one of …`, `cannot read <file>`, or a template it could not load. Its `report-lint:` line on stderr names which one. Fix the call or the path and re-run; the report was never read, so exit 2 says nothing about it.
+
+## Invoke /commit-changes
+
+Then invoke the `/commit-changes` skill with `--scope {work-item-dir}`, plus one `--scope` for each path in `{extra-scope-paths}` (below). This stages new, modified and deleted files **inside those paths only** (`git add -- {work-item-dir} …`), including the finalised implementation report. It sweeps in neither unrelated untracked paths nor another session's tracked edits in a shared checkout (obs #142).
+
+> **`{extra-scope-paths}` — the writes this pipeline makes outside its work item.** Scoped staging
+> carries only what it is told to carry. Before task.147 a whole-tree `git add -u` swept these in
+> silently, and one caller depended on it without saying so (task.147 QA-1, CR-2):
+>
+> | Caller | `{extra-scope-paths}` | Written by |
+> | --- | --- | --- |
+> | `develop-story`, `develop-task` | *(empty)* | — (`/finalise` commits the task registry itself, at its Step 7 action 6a) |
+> | `develop-bug`, story or task bug | *(empty)* | — |
+> | `develop-bug`, **general** bug | `docs/bugs/bug-registry.md` | Step 7 B3 (the registry row's close) |
+>
+> A caller that adds a write outside its work item adds a row here in the same change. The same
+> list is passed to check 5, so an uncommitted write there fails the step rather than reading as
+> another session's dirt.
+>
+> Check 5 adds one more set on its own: every path Step 4's Pre-flight Guard **held and restored**
+> (`.claude/state/step4-held-paths.txt`) that still exists. The guard holds any untracked path
+> outside the Step 4 scope. That includes a new file of the run's own in a directory with no tracked
+> change. Unscoped, check 5 used to fail on it; scoped, it would read as another session's dirt and
+> pass while the file is not on the remote (task.147 QA-2, CR-1). A held file that really is another
+> session's therefore fails here too, and is named. That is a deliberate trade: the pipeline moved
+> it, so it cannot claim it did not see it. Commit it, move it out of the checkout, or delete the
+> record line for it, and re-run the checklist.
+
+
+> **What this commit carries changed with task.115.** The acceptance artefacts — the document with
+> `status: accepted`, the DoD summary, `sprint-review-summary.md` and (tasks) the ticked registry —
+> are committed and pushed by `/finalise` itself at its Step 7 action 6a, *before* any PR or tracker
+> side-effect, so that CI can be read on the head that carries the acceptance. This Step 8 commit is
+> therefore the **implementation report and nothing else new** — with one expected residue: on a Jira
+> project the document carries a frontmatter-only `jira_last_*` rewrite from Step 7 action 8's
+> Document-link re-point, which runs after the 6a commit by design and rides here. If `git status`
+> shows a `*.dod.*` file, the sprint review, or any change to the document beyond those three keys,
+> `/finalise` did not cross its publish boundary — that is a Step 7 defect to surface (the step-7 doc's
+> "publish boundary" section has the mechanical check), not something for this sweep to absorb
+> silently. Note also that this
+> commit is docs-only and lands *after* the second CI reading; that residue is deliberate (recording
+> a verification inside the commit it verifies needs a third commit) and `develop-next` Step 3
+> re-verifies the final head before merging.
+
+```
+/commit-changes --scope {work-item-dir} [--scope <each path in {extra-scope-paths}>]
+```
+
+The implementation report and all other work-item artifacts must be staged and included in this commit.
+
+After `/commit-changes` completes, run `git log --oneline -1` to capture the final commit hash, and report it in the Phase 2 completion output. **Do not write it into the report.** A commit cannot record its own hash without a further commit, and that edit is exactly the post-commit dirt check 5 refuses; `git log` is the record (task 160).
+
+---
+
+## Final Push
+
+Push the final commit so the PR reflects the completed implementation report and DoD summary:
+```bash
+git push origin HEAD
+```
+
+The Pipeline Progress row for Step 8 was already set before the commit (§ Final Implementation Report Update); there is nothing to update here.
+
+---
+
+## Cleanup Transient State
+
+Remove any leftover test-output logs and this run's own halt snapshot. **The lock is not removed here.** It stays at `current_step` 8 until the Completion Checklist below passes, so a pause, crash or HALT during Cleanup or the checklist still leaves a record to resume from (task 161):
+
+```bash
+# Remove transient test-output logs from Step 3 develop loop iterations.
+# Successful iterations remove their own log on TEST_EXIT==0; this catches
+# logs left behind by failed iterations that later recovered, plus any
+# logs from prior aborted runs that never reached cleanup.
+# `find -delete`, not an `rm` glob: an unmatched glob is a zsh `nomatch` abort
+# (obs #111; docs/reference/anti-patterns.md § "Never put a must-succeed path
+# and a glob in one `rm` argv").
+find .claude/state -maxdepth 1 -name 'test-output-*.log' -delete 2>/dev/null || true
+
+# Delete the halt snapshot this run's own earlier HALT left behind — and ONLY
+# this run's. A completed run used to leave `last-halt.json` on disk, and the
+# next `/develop-*` invocation was offered a resume of merged work (obs #88).
+# Match on the snapshot's task_or_story_directory, canonicalised the way
+# advance-pipeline-lock.sh --restore compares it (relative and absolute
+# spellings of one directory are one directory); a snapshot for ANOTHER
+# document is left for its own run's detector to refuse.
+SNAPSHOT=.claude/state/develop-pipeline.last-halt.json
+if [ -f "$SNAPSHOT" ]; then
+  canon() { local s; s=$(printf '%s' "$1" | sed -E 's#^\./##; s#/+$##'); (cd "$s" 2>/dev/null && pwd -P) || printf '%s' "$s"; }
+  SNAP_DIR=$(jq -r '.task_or_story_directory // ""' "$SNAPSHOT" 2>/dev/null)
+  if [ -n "$SNAP_DIR" ] && [ "$(canon "$SNAP_DIR")" = "$(canon "{work-item-dir}")" ]; then
+    rm -f "$SNAPSHOT" && echo "halt snapshot for this run removed"
+  elif ! jq -e 'type == "object"' "$SNAPSHOT" >/dev/null 2>&1; then
+    # An EMPTY SNAP_DIR is reached by two states — a parsed object with no directory (legacy)
+    # and a snapshot jq could not read at all. The second is left alone, named: a corrupt file
+    # is not evidence of anything and may be another run's (task.130 QA cycle 1, CR-3).
+    echo "halt snapshot at $SNAPSHOT is not a JSON object — left in place; inspect it by hand"
+  elif [ -z "$SNAP_DIR" ]; then
+    # A snapshot with no directory predates task.123 and can belong to no run that will
+    # resume it (--restore refuses it without --accept-legacy; task.130). Delete it only when
+    # it is the SOLE candidate on disk — beside a live claim it might be the operator's
+    # evidence. Count the claims with `find`, never a glob: under zsh an unmatched glob is
+    # `nomatch`, which aborts `ls <path> <glob> | wc -l` AND a `for f in <path> <glob>` loop
+    # alike (the loop form was proposed and found aborting by halt-snippet-glob-safe.test.mjs
+    # F1 under zsh); docs/reference/anti-patterns.md § "Never put a must-succeed path and a
+    # glob in one `rm` argv".
+    n=1   # the snapshot itself
+    while IFS= read -r f; do [ -n "$f" ] && n=$((n + 1)); done \
+      < <(find .claude/state -maxdepth 1 -name 'develop-pipeline.lock.pausing.*' -type f 2>/dev/null)
+    if [ "$n" -eq 1 ]; then
+      rm -f "$SNAPSHOT" && echo "legacy snapshot (no directory) removed — it belonged to no resumable run"
+    else
+      # Named, not silent: a kept file must be distinguishable from "no snapshot found" (CR-7).
+      echo "legacy snapshot (no directory) left in place beside $((n - 1)) orphaned claim(s) — inspect .claude/state by hand"
+    fi
+  fi
+fi
+```
+
+---
+
+## Step 8 Completion Checklist (BLOCKING — verify before emitting the Phase 2 Completion banner)
+
+Run these post-condition checks. **If any fails, do NOT emit "Story/Task Development Complete" — fix the gap and re-check.** Checks 2–5 run first. Only when all of them pass does the block run `advance-pipeline-lock.sh --complete`, and check 1 then confirms the lock is gone. A failed check exits before `--complete`, so the lock stays at `current_step` 8: the Stop hook keeps guarding the step, and a HALT from here snapshots it as `halt_step: 8` (task 161).
+
+```bash
+# 2. Test-output logs cleaned (`find`, not `ls <glob>`: an unmatched glob aborts under zsh)
+[ -z "$(find .claude/state -maxdepth 1 -name 'test-output-*.log' 2>/dev/null)" ] || { echo "❌ Step 8 incomplete: test-output logs remain"; exit 1; }
+
+# 2b. No halt snapshot for THIS work item survives the run (task.124 — a snapshot that
+#     outlives its run is offered as a resume for merged work on the next invocation)
+if [ -f .claude/state/develop-pipeline.last-halt.json ]; then
+  SNAP_DIR=$(jq -r '.task_or_story_directory // ""' .claude/state/develop-pipeline.last-halt.json 2>/dev/null)
+  [ -n "$SNAP_DIR" ] && [ "$(cd "$SNAP_DIR" 2>/dev/null && pwd -P)" = "$(cd "{work-item-dir}" && pwd -P)" ] \
+    && { echo "❌ Step 8 incomplete: halt snapshot for this work item still present"; exit 1; }
+fi
+
+# 3. Implementation report finalised — Final Status must be 'Completed' or 'Accepted', Finished must NOT be '—'.
+#    Both bold forms: the template's story and task variants write `**Final Status**:` (colon
+#    outside the bold) and the bug variant's header writes `**Final Status:**` (inside). A regex
+#    for one form failed every report written from the other (obs #173).
+REPORT="${IMPLEMENTATION_REPORT:?must be set from lock or context}"
+grep -qE "^\*\*Final Status(:\*\*|\*\*:) (Completed|Accepted)" "$REPORT" || { echo "❌ Step 8 incomplete: Final Status not set to Completed/Accepted in $REPORT"; exit 1; }
+grep -qE "^\*\*Finished(:\*\*|\*\*:) [0-9]" "$REPORT" || { echo "❌ Step 8 incomplete: Finished timestamp missing in $REPORT"; exit 1; }
+
+# 4. Every step row in the Pipeline Progress TABLE is finished — its `|` rows only. The whole
+#    report is not read: the PreCompact hook's pause section names `⏳ Pending` in prose (obs #200).
+#    An ALLOWLIST, not a deny-list (task 160): a list of unfinished states passes every state it
+#    forgot (❌ Failed, ⚠️ Needs Attention, 🔄 …, an empty cell). Finished = a Status cell that starts
+#    with ✅ (any detail after it: `✅ Done (PASS 100/100)`, `✅ Skipped (…)`), or reads `⏭️ Skipped`,
+#    with or without the U+FE0F variation selector. Everything else fails, and the row is printed.
+#    The Status column is found by its HEADER, never by index: Task/Story carry it in the 2nd cell,
+#    Bug in the 3rd. Only the Status cell is read, so a Notes cell naming a state is prose.
+#    Three ways to have nothing to look at, and each fails rather than passing: no table, no Status
+#    column, no step rows under the header. `!col { next }` is load-bearing — with no Status column,
+#    `$col` is `$""`, which BSD awk rejects as a fatal error — and so is the `||` on the assignment:
+#    a command substitution drops awk's exit status, and an awk that died would read as a clean pass.
+#    The awk braces are spaced on purpose: an unspaced `{exit}` reads as a `{placeholder}`.
+PROGRESS_ROWS=$(awk '/^## Pipeline Progress[[:space:]]*$/ { f = 1; next } f && /^## / { exit } f && /^\|/' "$REPORT")
+[ -n "$PROGRESS_ROWS" ] || { echo "❌ Step 8 incomplete: no Pipeline Progress table found in $REPORT"; exit 1; }
+UNFINISHED=$(printf '%s\n' "$PROGRESS_ROWS" | awk -F'|' '
+  NR == 1 { for (i = 2; i < NF; i++) { c = $i; gsub(/^[[:space:]]+|[[:space:]]+$/, "", c); if (c == "Status") col = i } ; next }
+  /^\|[-:[:space:]|]+$/ { next }
+  !col { next }
+  { n++; s = $col; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+    if (s ~ /^✅/ || s ~ /^⏭[^|[:alnum:]]*Skipped$/) next
+    print }
+  END { if (!col) print "no Status column in the header row"; else if (!n) print "no step rows under the header" }') \
+  || { echo "❌ Step 8 incomplete: could not read the Pipeline Progress table in $REPORT (awk exited non-zero)"; exit 1; }
+[ -z "$UNFINISHED" ] || { echo "❌ Step 8 incomplete: Pipeline Progress has a row that is not finished (✅ or ⏭️ Skipped):"; printf '   %s\n' "$UNFINISHED"; exit 1; }
+
+# 5. The work actually exists on the remote — commits present, tree clean WITHIN THE WORK ITEM,
+#    local HEAD == remote HEAD, and (when a PR is open) PR head == local HEAD. --scope names dirt
+#    outside {work-item-dir} as a warning instead of failing on it: in a checkout another session
+#    is editing, that dirt is not this run's, and failing on it made the step unpassable on a
+#    correct run (obs #142, task.128).
+#    Run it UNPIPED and read its own exit status; see the note below.
+#    BASE_BRANCH is bound HERE, from the PR's own base — Step 8 runs after Step 4, so the branch
+#    has a PR, and this is the first source the resume contract's probe reads too. It was read
+#    unbound (`${BASE_BRANCH:?}`) through five green cycles because every host ran a feature
+#    branch off develop (obs #133, task.132); a block that reads a name must bind it.
+#    The read goes through pr-read.sh, which branches on VCS: `gh` on GitHub, the Bitbucket REST
+#    API on Bitbucket (`.destination.branch.name`). It used to be `gh` only, so on Bitbucket this
+#    halted on "no PR on this branch" for a branch that had one. The failure message is the
+#    read's own — which read failed, and the HTTP status on Bitbucket — never a guess at why.
+#    PR_NUMBER, when the caller did not bind it, is taken from the same read, so check 5 below
+#    compares the PR head on both forges instead of silently skipping it.
+#    The scope is the work item PLUS the caller's {extra-scope-paths} (the table above): a write
+#    this pipeline made outside its work item is its own unfinished work, not another session's.
+source .agents/skills/{develop-story|develop-task|develop-bug}/references/pr-read.sh \
+  || { echo "❌ Step 8 incomplete: pr-read.sh not found — re-run the bundler"; exit 1; }
+# An array, never `${PR_NUMBER:+--pr "$PR_NUMBER"}`: zsh does not word-split that expansion, so the
+# callee received ONE argument, "--pr 7", and verify-push-state exited 2 on "unknown argument".
+PR_ARGS=()
+[ -z "${PR_NUMBER:-}" ] || PR_ARGS=(--pr "$PR_NUMBER")
+pr_read "${PR_ARGS[@]}"
+PR_READ_RC=$?
+BASE_BRANCH="$PR_READ_BASE"
+{ [ "$PR_READ_RC" -eq 0 ] && [ -n "$BASE_BRANCH" ]; } \
+  || { echo "❌ Step 8 incomplete: cannot bind BASE_BRANCH — $PR_READ_ERROR"; exit 1; }
+PR_NUMBER="${PR_NUMBER:-$PR_READ_NUMBER}"
+PR_ARGS=(--pr "$PR_NUMBER")
+EXTRA_SCOPES=({extra-scope-paths})
+SCOPE_ARGS=(--scope "{work-item-dir}")
+for s in "${EXTRA_SCOPES[@]}"; do SCOPE_ARGS+=(--scope "$s"); done
+# Paths Step 4's guard held and restored: scoped, so one still uncommitted fails (see above). Only a
+# record for THIS work item is read (first line), and only paths that still exist are passed,
+# because verify-push-state refuses a scope that names nothing.
+HELD_REC=.claude/state/step4-held-paths.txt
+if [ "$(head -1 "$HELD_REC" 2>/dev/null)" = "{work-item-dir}" ]; then
+  while IFS= read -r p; do
+    p="${p%/}"
+    [ -n "$p" ] && [ -e "$p" ] && SCOPE_ARGS+=(--scope "$p")
+  done < <(tail -n +2 "$HELD_REC")
+elif [ -s "$HELD_REC" ]; then
+  # Named, never silent: a record for another work item is not applied here (task.147 QA-3, CR-2).
+  echo "⚠️  $HELD_REC names $(head -1 "$HELD_REC"), not {work-item-dir} — its held paths are not checked"
+fi
+# Restore deletes the hold-dir record, so a record that still names a non-empty directory means
+# held files were never restored. Absent from the tree, they would slip past the scope above, and
+# the cleanup below would delete the only pointer to them (task.147 QA-3, CR-3).
+HOLD_REC_DIR=$(cat .claude/state/step4-hold-dir.txt 2>/dev/null)
+if [ -n "$HOLD_REC_DIR" ] && [ -n "$(ls -A "$HOLD_REC_DIR" 2>/dev/null)" ]; then
+  echo "❌ Step 8 incomplete: Step 4 held files were never restored — run the Restore Held Files block (they are in $HOLD_REC_DIR)"; exit 1
+fi
+bash .agents/skills/{develop-story|develop-task|develop-bug}/references/verify-push-state.sh --base "$BASE_BRANCH" "${SCOPE_ARGS[@]}" "${PR_ARGS[@]}"
+VERIFY_EXIT=$?
+[ "$VERIFY_EXIT" -eq 0 ] || { echo "❌ Step 8 incomplete: verify-push-state failed (exit $VERIFY_EXIT)"; exit 1; }
+
+# Every check passed: Step 4's records have done their job. A record left behind would be read as
+# current by the next run in this checkout (task.147 QA-2, CR-7).
+rm -f .claude/state/step4-scope-paths.txt .claude/state/step4-held-paths.txt .claude/state/step4-hold-dir.txt
+# The 5c carry records too: 6a has committed the set, and a list left behind must not be read by a
+# later run's resume probe (task.173 QA-3, CR-1).
+rm -f .claude/state/5c-carry-eligible.txt .claude/state/5c-carry-classified.txt
+
+# Checks 2–5 passed: end the run. `--complete` is the lock's one terminal remover — `/commit-changes`
+# left the lock in place at step 8 (task 161). It runs HERE, after every check, never earlier: a
+# failed check above exits with the lock still at 8, which is what keeps a resume possible.
+bash .agents/skills/{develop-story|develop-task|develop-bug}/references/advance-pipeline-lock.sh --complete
+
+# 1. Lock file removed — by --complete, the one terminal remover, only after checks 2–5 passed
+[ ! -f .claude/state/develop-pipeline.lock ] || { echo "❌ Step 8 incomplete: lock file still present"; exit 1; }
+
+echo "✅ Step 8 post-conditions verified"
+```
+
+Checks 1–4 (and 2b) address regressions #3 and #4 from the live-github-test and obs #88 (impl report stuck at "In Progress / Finished: —", lock file not removed). Treat the bash assertions as binding — emit the Phase 2 Completion banner only after all five pass. Check 1 runs last because the lock it asserts absent is removed by the block itself, after checks 2–5.
+
+---
+
+## Why check 5 exists, and why it is mechanical rather than an instruction
+
+On 2026-08-13 a pipeline reported a "PR-ready branch pushed" and, separately, that a trunk fix had been "isolated in its own commit so the orchestrator can drop it at rebase". **Neither was true.** The branch ref existed on the remote but pointed at the base tip — **0 commits** — and every file was still an uncommitted working-tree modification. The orchestrator relayed that claim to two sibling pipelines and planned a merge around it.
+
+The develop-batch merge gate's head-SHA check would have refused the merge, so nothing broken could ship. But that check runs at **merge** time, and the false claim was acted on well before it. That gap is the cost, and it is why this assertion belongs at **report** time.
+
+**Do not "fix" this class of problem by strengthening the prose.** The prompt already said to report the PR; adding "and be accurate" changes nothing, because the failure is not disobedience — it is reporting an intention as an accomplishment without looking. Only a mechanical check whose output is pasted into the report closes it.
+
+**Paste the script's output verbatim into the final report.** A summary of a verification is not a verification.
+
+⚠️ **Read the script's own exit status — never a pipeline's.** The same session produced *three* separate false passes from exactly that mistake: `npm test 2>&1 | tail -80` reported `tail`'s exit 0 over a suite that had failed, and twice more from wrapper scripts whose status came from a trailing `grep`/`echo`. If the output is large, redirect to a file and read the file:
+
+```bash
+bash .../verify-push-state.sh --base "$BASE_BRANCH" "${SCOPE_ARGS[@]}" > /tmp/verify.log 2>&1; VERIFY_EXIT=$?
+```
+
+Each `! outside scope (warning): <path>` line the scoped run prints names a dirty path this run did not make. Paste those lines too: they are how an operator sees a concurrent session, or a file `/develop` edited that Step 4's scope did not reach.
+
+`{skill}` above is the pipeline's own skill directory (`develop-story`, `develop-task` or `develop-bug`) — each vendors its own copy of the script under `references/`.

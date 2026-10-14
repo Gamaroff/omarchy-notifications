@@ -1,0 +1,1222 @@
+// AUTO-GENERATED — DO NOT EDIT. Source: shared/resources/security-input-corpus.mjs. Regenerate via `npm run bundle`.
+// The inputs already known to defeat each sink, stated once — so a probe tests
+// what is known to get past a control rather than what an agent recalled.
+//
+// Pure data plus two accessors. No filesystem, no network, no process, and
+// nothing is executed on import: this module supplies inputs, it does not run
+// them. Importing it must be safe in any context, including a security review
+// of the module itself.
+//
+// Prose peer: security-input-corpus.md, which argues what a sink is and states
+// the method ordering. The two files carry the same cases.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// EVERY SINK CARRIES BOTH DIRECTIONS. `legitimate` is not optional.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// An implementation that closes a hole by refusing everything passes a
+// hostile-only corpus perfectly, and is also a defect. Without the accept
+// direction an over-strict boundary and a correct one produce identical output.
+// tests/security-input-corpus.test.mjs asserts the floor, which is the
+// difference between an instruction a model may skip and a guarantee.
+//
+// `why` reads in both directions: for a `hostile` case it is what goes wrong
+// when the input is accepted; for a `legitimate` case it is why an over-strict
+// implementation wrongly refuses it. `correct` always states what a right
+// implementation does to the input — that is the field that lets an engine
+// compute a verdict instead of asking an agent to judge one.
+
+/** The sink taxonomy. Additive — nothing depends on this set being closed. */
+export const SINKS = Object.freeze([
+  "url-authority",
+  "sql-orm",
+  "shell-exec",
+  "path",
+  "template-render",
+  "filename",
+  "markdown-structure",
+]);
+
+/** The two directions every sink must cover. */
+export const DIRECTIONS = Object.freeze(["hostile", "legitimate"]);
+
+/** The frozen case shape. Every key is required and every value non-empty. */
+export const CASE_FIELDS = Object.freeze([
+  "id",
+  "sink",
+  "input",
+  "why",
+  "correct",
+  "direction",
+]);
+
+/**
+ * Fields a case MAY carry beyond CASE_FIELDS. `expected` is the machine-readable
+ * pass condition for a sink whose cases are MATERIALISED — written to a fixture
+ * directory and run against a script — rather than passed to a function as a
+ * value. For those, `correct` (prose) cannot be compared mechanically and
+ * `direction` alone cannot say what a right script PRINTS; `expected` can:
+ *
+ *   { stdout: "12\n", exit: 0, stderr: "", absent: ["PWNED"] }
+ *
+ * Every key is compared. `stderr: ""` is load-bearing — a script that leaks an
+ * arithmetic error and still prints the right value has not handled the name.
+ * `absent` lists paths, relative to the fixture directory, that a correct run
+ * must NOT create: it is how a command-substitution name is caught when the
+ * substitution ran but the number still came out right.
+ *
+ * `fixture` is read only by the `fence:` (task.180) and `shell-argv:` (task.181)
+ * entry forms — for `shell-argv:`, written before its `--fixture-setup` runs:
+ *
+ *   { env: { npm_config_loglevel: "silent" }, files: { ".npmrc": "loglevel=silent\n" } }
+ *
+ * `env` is merged into the case's environment (it may not set HOME, TMPDIR or
+ * LC_ALL, which the sandbox owns); `files` are written into the case's own
+ * directory, which is the block's cwd. No corpus case carries it.
+ */
+export const OPTIONAL_CASE_FIELDS = Object.freeze(["expected", "fixture"]);
+
+/**
+ * Sinks whose cases materialise as a FIXTURE DIRECTORY rather than as a string.
+ *
+ * A hostile filename is hostile as a directory entry, not as a value: a script
+ * that lists a directory meets it through the glob, not through an argument. So
+ * the engine creates a directory per case, writes these controls plus the case's
+ * own name, and runs the script under probe against the directory.
+ *
+ * The controls BRACKET the case. Globs are sorted (strcoll, which the engine
+ * pins to byte order with LC_ALL=C), and the defect this sink was built from —
+ * qa-cycle.sh printing a lower, wrong cycle after a newline-bearing name aborted
+ * its loop (task.121) — only shows in stdout when the hostile name is processed
+ * AFTER a lower gate and BEFORE the highest one. `!` (0x21) sorts before every
+ * printable name and `~` (0x7E) after every ASCII one, so a hostile name always
+ * lands between them; a legitimate case carries a number above the high control
+ * so it wins on its own. Verified on the pre-fix script: without the bracket,
+ * pre-fix and fixed print the same value on every ordering the plan proposed.
+ */
+export const MATERIALISED_SINKS = Object.freeze({
+  filename: Object.freeze({
+    controls: Object.freeze(["!.gate.3.control.yml", "~.gate.12.control.yml"]),
+    /** What the high control makes a correct script print when the case is handled. */
+    highValue: "12",
+  }),
+});
+
+/**
+ * Stamp the sink onto each case, namespace its id, and freeze the result.
+ * Ids are namespaced here rather than by hand so a copy-pasted case cannot
+ * silently collide with the one it was copied from.
+ */
+function sinkCases(sink, cases) {
+  return Object.freeze(
+    cases.map((c) =>
+      Object.freeze({
+        id: `${sink}.${c.id}`,
+        sink,
+        input: c.input,
+        why: c.why,
+        correct: c.correct,
+        direction: c.direction,
+        // Only a materialised sink's cases carry it; the key is absent, not
+        // null, elsewhere so the frozen-shape test keeps its exact key set.
+        ...(c.expected !== undefined
+          ? { expected: Object.freeze({ ...c.expected }) }
+          : {}),
+      }),
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// url-authority — a URL or DSN parser deciding where a connection goes
+// ---------------------------------------------------------------------------
+// The through-line: authority delimiters are silent. A misplaced one does not
+// raise; it re-points the connection and drops whatever followed.
+
+const URL_AUTHORITY = sinkCases("url-authority", [
+  {
+    id: "host-with-slash",
+    direction: "hostile",
+    input: "evil.example.com/x",
+    why: "A `/` ends the authority, so everything after it becomes a path — and a port that followed the host is silently lost. No error is raised: the connection goes to a different host on the default port.",
+    correct:
+      'REJECT a host component containing `/`, `?`, `#`, `@` or whitespace, before the URL is built. Setting fields on a URL object is not sufficient here and must not be graded as a pass: `u.host = "evil.example.com/x"` on a URL with port 5432 silently yields host `evil.example.com`, port `5432` — the setter truncates at the `/` and raises nothing, which is the same re-pointing as concatenation with a cleaner-looking diff.',
+  },
+  {
+    id: "query-in-path-segment",
+    direction: "hostile",
+    input: "db?sslmode=disable",
+    why: "A `?` starts the query string, so what the author intended as a database-name path segment silently becomes a connection parameter — here one that turns TLS off.",
+    correct:
+      "Percent-encode the segment with encodeURIComponent so `?` becomes `%3F` and stays part of the name.",
+  },
+  {
+    id: "base64-secret-in-userinfo",
+    direction: "hostile",
+    input: "a/b+c=d",
+    why: "Generated secrets routinely contain the base64 alphabet. A spec-compliant parser rejects the raw form; a naive splitter lets the `/` terminate the authority so the remainder becomes a path — the credential is then both wrong and disclosed in a path that gets logged.",
+    correct:
+      "encodeURIComponent the credential before interpolation; never string-concatenate a secret into a DSN.",
+  },
+  {
+    id: "userinfo-delimiter",
+    direction: "hostile",
+    input: "p@ss",
+    why: 'In a hand-rolled DSN parser that splits userinfo at the FIRST `@`, a password containing one re-points the connection at a host named after the password\'s tail. A spec-compliant parser splits at the LAST `@` instead and percent-encodes the value — `new URL("postgres://u:p@ss@h/db")` gives password `p%40ss` and host `h`. The same input is therefore silently wrong in one parser and silently fine in the other, which is harder to find than either failure alone.',
+    correct:
+      "Percent-encode to `%40` before interpolation, so both parsers agree.",
+  },
+  {
+    id: "port-delimiter",
+    direction: "hostile",
+    input: "pa:ss",
+    why: 'In the USERNAME position `:` starts the password, and in the HOST position it starts the port — a naive splitter truncates at it in both. In the PASSWORD position it is preserved: `new URL("postgres://u:pa:ss@h/db").password` is `pa%3Ass`. The truncation is position-dependent, which is what makes it easy to test in the wrong slot and conclude the value is safe.',
+    correct:
+      "Percent-encode to `%3A`, and test the value in the position it will actually occupy.",
+  },
+  {
+    id: "fragment-delimiter",
+    direction: "hostile",
+    input: "secret#1",
+    why: "`#` starts the fragment, which is never sent to the server. A spec-compliant parser rejects it in the userinfo position outright; a naive splitter accepts it and truncates the credential at the `#`, so the request goes out with a shortened secret and fails authentication far from its cause.",
+    correct: "Percent-encode to `%23` before interpolation.",
+  },
+  {
+    id: "ipv6-brackets",
+    direction: "hostile",
+    input: "[::1]",
+    why: "`[::1]` is a valid IPv6 loopback literal, so it parses cleanly — and that is the hazard, not a parse failure. A host field carrying it re-points the connection at the machine running the code, reaching services bound to loopback precisely because they are unauthenticated.",
+    correct:
+      "Resolve the host and reject loopback, link-local and private ranges whenever the destination is meant to be external; emit brackets only around an actual IPv6 literal.",
+  },
+  {
+    id: "whitespace",
+    direction: "hostile",
+    input: "exa mple.com",
+    why: "Whitespace is not valid in an authority, and parsers variously strip, reject, or truncate at it — so the same configuration works in one library and silently addresses something else in another.",
+    correct:
+      "Reject the value explicitly. Do not trim silently: a trim turns a malformed input into a plausible one.",
+  },
+  {
+    id: "empty-host",
+    direction: "hostile",
+    input: "",
+    why: 'Concatenation yields `scheme://:5432/db`. A spec-compliant parser rejects that outright — `new URL("postgres://:5432/db")` throws — but several driver-specific DSN parsers accept it and fall back to a default host. So a missing configuration value becomes a connection to the developer\'s own machine in exactly the parsers that do not raise.',
+    correct:
+      "Reject empty required components explicitly, before the string is built. Do not rely on the parser: its behaviour here differs by library, and the libraries that stay quiet are the dangerous ones.",
+  },
+  {
+    id: "plain-host",
+    direction: "legitimate",
+    input: "db.internal.example.com",
+    why: "The ordinary case. A host allow-list narrow enough to reject an internal domain is the over-refusal this direction catches.",
+    correct: "Accept unchanged.",
+  },
+  {
+    id: "encoded-secret-roundtrip",
+    direction: "legitimate",
+    input: "a%2Fb%2Bc%3Dd",
+    why: "The correctly-encoded form of the base64 secret above. Refusing credentials containing `/` or `+` is an over-refusal — the fix is encoding, not rejection — and a validator that rejects the encoded form makes correct code impossible to write.",
+    correct: "Accept, and decode back to exactly `a/b+c=d`.",
+  },
+  {
+    id: "explicit-port",
+    direction: "legitimate",
+    input: "db.internal.example.com:5432",
+    why: "A colon in the host position is legal and load-bearing. A rule that bans `:` outright to stop the userinfo case above also bans every explicit port.",
+    correct: "Accept, preserving host and port as separate components.",
+  },
+]);
+
+// ---------------------------------------------------------------------------
+// sql-orm — a SQL engine deciding what statement to run
+// ---------------------------------------------------------------------------
+
+const SQL_ORM = sinkCases("sql-orm", [
+  {
+    id: "single-quote",
+    direction: "hostile",
+    input: "'",
+    why: "Terminates a concatenated string literal, so the remainder of the value is parsed as SQL rather than as data.",
+    correct:
+      "Bind the value as a parameter. The driver sends it out-of-band from the statement text, so no quoting is involved and none can be got wrong.",
+  },
+  {
+    id: "classic-tautology",
+    direction: "hostile",
+    input: "' OR '1'='1",
+    why: "Closes the literal and appends a predicate that is always true, turning a single-row lookup into a full-table read.",
+    correct:
+      "Bind the value as a parameter; the whole string becomes one comparison operand.",
+  },
+  {
+    id: "comment-introducer",
+    direction: "hostile",
+    input: "--",
+    why: "Comments out the rest of the statement, including any trailing `AND tenant_id = ?` that was carrying the authorisation.",
+    correct: "Bind the value as a parameter.",
+  },
+  {
+    id: "statement-separator",
+    direction: "hostile",
+    input: "; DROP TABLE users; --",
+    why: "Ends the statement and starts another. Whether the second one runs depends on whether the driver has multi-statement execution enabled — a setting the calling code usually does not know.",
+    correct:
+      "Bind the value as a parameter, and leave multi-statement execution off.",
+  },
+  {
+    id: "backslash-escape",
+    direction: "hostile",
+    input: "\\'",
+    why: "Backslash escaping is engine- and mode-dependent (MySQL's NO_BACKSLASH_ESCAPES changes it outright), so a hand-written escaper correct against one engine is wrong against another — and against the same engine differently configured.",
+    correct:
+      "Bind the value as a parameter. Hand-written escaping is the defect, not the fix.",
+  },
+  {
+    id: "homoglyph-quote",
+    direction: "hostile",
+    input: "＇",
+    why: "U+FF07 FULLWIDTH APOSTROPHE is not U+0027, so a deny-list keyed on the ASCII quote does not see it. Whether it then BECOMES an apostrophe depends on the conversion, and the conversions disagree — measured: `iconv -f UTF-8 -t CP1252` folds it to the byte 0x27 and NFKC normalisation yields U+0027, while Node's latin1 conversion yields 0x07 and MySQL's utf8mb4→latin1 substitutes `?`. The deny-list is defeated in every case; the escalation to injection needs a folding conversion specifically.",
+    correct:
+      "Bind the value as a parameter. Character deny-lists cannot enumerate Unicode; parameterisation does not need to.",
+  },
+  {
+    id: "like-wildcards",
+    direction: "hostile",
+    input: "%",
+    why: "Parameter binding makes this safe as data and still leaves it a wildcard: inside a LIKE it matches everything, so a filter meant to scope rows to one tenant matches all of them. Bound is not the same as inert.",
+    correct:
+      "Escape LIKE metacharacters (`%`, `_`, and the escape character) in the value in addition to binding it, and declare the ESCAPE clause.",
+  },
+  {
+    id: "apostrophe-name",
+    direction: "legitimate",
+    input: "O'Brien",
+    why: "The commonest over-refusal in this sink: input filters that strip or reject quotes to stop the cases above corrupt real names, and the corruption is silent.",
+    correct: "Accept, bind, and read back byte-identical.",
+  },
+  {
+    id: "percent-literal",
+    direction: "legitimate",
+    input: "50% off",
+    why: "A literal `%` outside a LIKE context is ordinary text. A blanket wildcard-escape applied everywhere stores `50\\% off` instead.",
+    correct:
+      "Accept and round-trip unchanged; escape LIKE metacharacters only where a LIKE is actually used.",
+  },
+  {
+    id: "double-dash-text",
+    direction: "legitimate",
+    input: "see note -- pending",
+    why: "A double dash in a free-text field is prose, not a comment introducer. A deny-list on `--` rejects legitimate content.",
+    correct: "Accept and round-trip unchanged.",
+  },
+]);
+
+// ---------------------------------------------------------------------------
+// shell-exec — a shell deciding what command to run
+// ---------------------------------------------------------------------------
+// The 27 hostile cases here are measured, not invented: 14 from task.67.bug.3
+// and 13 from bug.6, both replayed verbatim in
+// evals/shared/tests/snippet-classifier-fail-open-replay.test.mjs. Every one of
+// them got past a classifier that looked correct on inspection.
+//
+// The 2 over-refusals from bug.6 seed the legitimate direction. They are worth
+// as much as the fail-opens: a gate that refuses legitimate documented commands
+// trains its users to bypass it.
+//
+// The common shape: the string a scanner reads is not the command the shell
+// runs. Quote removal, escape removal, globbing, expansion, keyword nesting and
+// redirection each change the effective command after the scan and before the
+// exec.
+
+const SHELL_EXEC = sinkCases("shell-exec", [
+  {
+    id: "quote-split-single",
+    direction: "hostile",
+    input: "who'am'i",
+    why: "Quote removal rejoins the word to `whoami`, so a matcher comparing the raw token sees a command name that is on no list at all.",
+    correct:
+      "Compare the effective command word — after quote removal — not the literal token.",
+  },
+  {
+    id: "quote-split-double",
+    direction: "hostile",
+    input: 'to"u"ch /tmp/x',
+    why: "Double quotes split the same way: the effective command is `touch`, which writes.",
+    correct: "Apply quote removal before matching.",
+  },
+  {
+    id: "backslash-escape",
+    direction: "hostile",
+    input: "t\\ouch /tmp/x",
+    why: "`\\o` is just `o` after escape removal, so the effective command is `touch`.",
+    correct: "Apply escape removal before matching.",
+  },
+  {
+    id: "glob-bracket",
+    direction: "hostile",
+    input: "/usr/bin/[t]ouch /tmp/x",
+    why: "Pathname expansion resolves `[t]ouch` to `touch`; the literal never equals the name a list is keyed on.",
+    correct:
+      "Treat glob metacharacters in a command word as unresolvable and deny, rather than matching the unexpanded literal.",
+  },
+  {
+    id: "glob-question",
+    direction: "hostile",
+    input: "/usr/bin/touc? /tmp/x",
+    why: "`?` matches any single character, so the expansion is `touch`.",
+    correct:
+      "Same as the bracket case: an unresolvable command word is a deny.",
+  },
+  {
+    id: "tilde-traversal",
+    direction: "hostile",
+    input: "~/../../usr/bin/whoami",
+    why: "Tilde expansion followed by `..` traversal reaches an absolute path that a prefix check on `~/` is satisfied by and never sees.",
+    correct:
+      "Expand and normalise to a real path before deciding, then match on the result.",
+  },
+  {
+    id: "escaped-tool-name",
+    direction: "hostile",
+    input: "g\\h pr comment 1 --body x",
+    why: "Escape removal yields `gh`, so a rule keyed on the tool name `gh` does not fire and an outbound write posts.",
+    correct: "Apply escape removal before matching the tool name.",
+  },
+  {
+    id: "quote-split-curl",
+    direction: "hostile",
+    input: "cu'r'l -X POST https://x/",
+    why: "Quote removal yields `curl`, and the request is a POST — a network write from a command that scanned as unknown.",
+    correct: "Apply quote removal before matching.",
+  },
+  {
+    id: "heredoc-redirect",
+    direction: "hostile",
+    input: "cat <<EOF > /tmp/x",
+    why: "The write is in the redirection, not in the command word. `cat` inspects as read-only and the statement creates a file.",
+    correct:
+      "Parse redirections separately from the command word; any `>` or `>>` target is a write regardless of what precedes it.",
+  },
+  {
+    id: "heredoc-append-rc",
+    direction: "hostile",
+    input: "cat <<'EOF' >> ~/.zshrc",
+    why: "The same shape, appending to a shell rc file — a persistent change that runs again in every future shell.",
+    correct:
+      "Treat `>>` as a write, and a write to a shell rc path as persistent, regardless of the command word.",
+  },
+  {
+    id: "sed-inplace-trailing",
+    direction: "hostile",
+    input: "sed 's/a/b/' -i file.txt",
+    why: "`-i` edits in place, and here it sits in trailing position — after the script operand — where a check that only inspects leading flags never looks.",
+    correct:
+      "Scan every argument position for write-capable flags, not just the leading run.",
+  },
+  {
+    id: "sed-inplace-after-e",
+    direction: "hostile",
+    input: "sed -e 's/a/b/' -i file.txt",
+    why: "The same trailing `-i`, now separated from the command by a flag that takes an operand — which is what makes a positional heuristic stop early.",
+    correct:
+      "Consume each flag's operand while scanning, and keep scanning to the end of the argument list.",
+  },
+  {
+    id: "sort-output-long",
+    direction: "hostile",
+    input: "sort --output=/tmp/x file.txt",
+    why: "`sort` reads as a read-only filter, and `--output=` writes a file. The write is in a flag the tool's reputation does not suggest.",
+    correct:
+      "Know the write-capable flags of every tool named by hand, in long and short form (`-o` and `--output`).",
+  },
+  {
+    id: "git-diff-output",
+    direction: "hostile",
+    input: "git diff --output=/tmp/x",
+    why: "`git diff` is the canonical read-only subcommand, and `--output=` makes it write.",
+    correct:
+      "Match on the (subcommand, flags) pair, not on the subcommand alone.",
+  },
+  {
+    id: "keyword-if",
+    direction: "hostile",
+    input: "if touch /tmp/x; then echo hi; fi",
+    why: "A shell keyword occupies command position, so a parser reading the first word sees `if` and swallows the whole segment — never reaching the `touch` inside it.",
+    correct:
+      "Recurse into keyword-introduced compound commands and classify each contained command on its own.",
+  },
+  {
+    id: "keyword-elif",
+    direction: "hostile",
+    input: "elif touch /tmp/x; then echo hi; fi",
+    why: "The same escape through a different keyword; enumerating `if` alone leaves the rest reachable.",
+    correct:
+      "Recurse into every compound-command keyword, not a hand-picked subset.",
+  },
+  {
+    id: "keyword-while",
+    direction: "hostile",
+    input: "while touch /tmp/x; do break; done",
+    why: "The loop condition is a command, and it runs — at least once — before the body is ever considered.",
+    correct: "Classify the loop condition as a command in its own right.",
+  },
+  {
+    id: "keyword-until",
+    direction: "hostile",
+    input: "until touch /tmp/x; do break; done",
+    why: "As `while`, with the sense inverted and the same command position unexamined.",
+    correct: "Classify the loop condition as a command in its own right.",
+  },
+  {
+    id: "keyword-case",
+    direction: "hostile",
+    input: "case x in a) touch /tmp/x;; esac",
+    why: "`case` puts commands after a pattern and a `)`, a position that whitespace tokenisation does not recognise as command-initial.",
+    correct: "Parse the case-arm structure and classify each arm's commands.",
+  },
+  {
+    id: "git-global-flag-operand",
+    direction: "hostile",
+    input: "git -C log push origin main",
+    why: "`-C` takes a directory operand. Reading the token after the flags as the subcommand yields `log` — read-only — when the real subcommand is `push`, which writes to a remote.",
+    correct:
+      "Consume each global flag's operand before reading the subcommand.",
+  },
+  {
+    id: "redirect-glued",
+    direction: "hostile",
+    input: "echo pwned>/tmp/x",
+    why: "No space before `>`, so whitespace tokenisation produces the single word `pwned>/tmp/x` and reports no redirection at all.",
+    correct:
+      "Tokenise redirection operators independently of whitespace — the shell does.",
+  },
+  {
+    id: "redirect-glued-cat",
+    direction: "hostile",
+    input: "cat README.md>/tmp/x",
+    why: "The same gluing, now attached to a filename, which makes the resulting token look even more like an ordinary operand.",
+    correct:
+      "Split redirection operators out of every token before classifying.",
+  },
+  {
+    id: "redirect-glued-append",
+    direction: "hostile",
+    input: "echo pwned>>/tmp/x",
+    why: "The append form glued the same way; a scan that special-cases a spaced ` > ` misses both.",
+    correct:
+      "Handle `>`, `>>`, `>|` and fd-prefixed forms as operators, not as text.",
+  },
+  {
+    id: "quote-state-span",
+    direction: "hostile",
+    input: `echo "it's fine"; touch /tmp/x; echo "don't"`,
+    why: "The apostrophe inside a double-quoted string opens a single-quote span for a scanner that ignores which quote type is already open. The span it then blanks runs across the `touch`, deleting it from the scan.",
+    correct:
+      "Track quote state per character, recording the enclosing quote type; an apostrophe inside double quotes is a literal.",
+  },
+  {
+    id: "heredoc-in-quoted-example",
+    direction: "hostile",
+    input: 'echo "example: cat <<EOF"\ntouch /tmp/x',
+    why: "A heredoc marker inside a quoted string is text, not a heredoc. Treating it as one consumes the following real command as heredoc body and never classifies it.",
+    correct: "Recognise heredoc operators only outside quoted spans.",
+  },
+  {
+    id: "sed-w-flag",
+    direction: "hostile",
+    input: "sed -n 's/a/b/w /tmp/x' README.md",
+    why: "`sed` writes a file through the `w` flag inside the script — with neither `-i` nor a shell redirection to notice.",
+    correct: "Parse the sed script itself, not only the tool's flags.",
+  },
+  {
+    id: "sed-w-command",
+    direction: "hostile",
+    input: "sed 'w /tmp/x' README.md",
+    why: "The bare `w` command form, which does not even carry a substitution to draw attention to the script.",
+    correct:
+      "Parse the sed script; treat `w` and `W` as writes wherever they appear in it.",
+  },
+  {
+    id: "grep-only-matching",
+    direction: "legitimate",
+    input: "grep -o 'foo' README.md",
+    why: "A blanket `-o means output file` heuristic refuses this. For grep, `-o` is `--only-matching`: it prints matched parts to stdout and writes nothing.",
+    correct: "Resolve flag meaning per tool. Accept as read-only.",
+  },
+  {
+    id: "find-or-operator",
+    direction: "legitimate",
+    input: "find . -name a -o -name b",
+    why: "The same heuristic refuses this one too. For find, `-o` is the boolean OR operator between predicates, not an output file.",
+    correct: "Resolve flag meaning per tool. Accept as read-only.",
+  },
+  {
+    id: "plain-read",
+    direction: "legitimate",
+    input: "cat README.md",
+    why: "The baseline. A classifier tightened until it refuses even this is passing the hostile half by refusing everything.",
+    correct: "Accept as read-only.",
+  },
+  {
+    id: "git-status-read",
+    direction: "legitimate",
+    input: "git status --short",
+    why: "A read-only subcommand carrying a flag. A rule that denies any `git` invocation with flags — a tempting response to the `-C` case above — rejects this too.",
+    correct:
+      "Accept as read-only: the subcommand decides, and `--short` only changes formatting.",
+  },
+]);
+
+// ---------------------------------------------------------------------------
+// path — a filesystem API deciding which file to open
+// ---------------------------------------------------------------------------
+
+const PATH = sinkCases("path", [
+  {
+    id: "dot-dot-relative",
+    direction: "hostile",
+    input: "../secrets.env",
+    why: "One level of traversal leaves the intended directory. The simplest case, and the one a containment check is usually written against.",
+    correct:
+      "Resolve against the root, then assert the result is inside the root before any filesystem call.",
+  },
+  {
+    id: "dot-dot-deep",
+    direction: "hostile",
+    input: "../../../../etc/passwd",
+    why: "Enough levels to reach the filesystem root from anywhere, so the depth of the intended directory provides no protection.",
+    correct: "Resolve and assert containment. Do not count directory levels.",
+  },
+  {
+    id: "absolute",
+    direction: "hostile",
+    input: "/etc/passwd",
+    why: "An absolute path discards the root when resolved — `path.join(root, '/etc/passwd')` keeps the root, but `path.resolve(root, '/etc/passwd')` does not, and which one the code used is easy to misread.",
+    correct:
+      "Reject absolute inputs explicitly, then resolve and assert containment.",
+  },
+  {
+    id: "encoded-traversal",
+    direction: "hostile",
+    input: "..%2f..%2fetc%2fpasswd",
+    why: "The containment check sees no `/` and passes; a later decode — in a router, a client, or the code itself — re-introduces the traversal after the check has already run.",
+    correct:
+      "Decode fully before validating, and validate immediately before use.",
+  },
+  {
+    id: "symlink-escape",
+    direction: "hostile",
+    input: "uploads/link-to-etc/passwd",
+    why: "Every component is inside the root lexically, and the filesystem resolves `link-to-etc` somewhere else. A `path.resolve` check is satisfied by a string the kernel does not agree with. **This case needs filesystem setup to discriminate**: without the symlink present, a realpath-checking implementation and one that skips realpath return the same verdict, so the input alone proves nothing.",
+    correct:
+      "realpath the resolved path — following symlinks — and re-assert containment on the result. To probe it, first create the fixture: a directory `<root>/uploads` containing a symlink `link-to-etc` → `/etc`. Then a correct implementation rejects; one that only resolves lexically accepts.",
+  },
+  {
+    id: "null-byte",
+    direction: "hostile",
+    input: "safe.txt\u0000.png",
+    why: "An extension check passes on `.png` while syscall layers that truncate at NUL open `safe.txt`. The validated string and the opened file are different strings.",
+    correct:
+      "Reject any input containing a NUL before any filesystem call or extension check.",
+  },
+  {
+    id: "prefix-not-boundary",
+    direction: "hostile",
+    input: "../data-evil/x",
+    why: "With root `/srv/data` this resolves to `/srv/data-evil/x`, which `startsWith('/srv/data')` accepts. The check passes on a sibling directory that merely shares a prefix.",
+    correct:
+      "Compare on a separator boundary — `resolved === root || resolved.startsWith(root + path.sep)`.",
+  },
+  {
+    id: "empty",
+    direction: "hostile",
+    input: "",
+    why: "Resolves to the root itself, so an operation meant for one file targets the whole directory — a delete or a chmod then applies to everything under it.",
+    correct:
+      "Reject empty input explicitly; a containment check alone accepts it.",
+  },
+  {
+    id: "nested-relative",
+    direction: "legitimate",
+    input: "reports/2026/q1.csv",
+    why: "The ordinary case. A rule that bans every `/` to stop traversal also bans every subdirectory.",
+    correct: "Accept, resolving to the file under the root.",
+  },
+  {
+    id: "dots-in-name",
+    direction: "legitimate",
+    input: "archive..2026.tar.gz",
+    why: "A naive `input.includes('..')` check rejects a legal filename. Traversal is `..` as a whole path component, not `..` as a substring.",
+    correct:
+      "Accept. Decide on the resolved path, not on a substring search of the input.",
+  },
+  {
+    id: "leading-dot",
+    direction: "legitimate",
+    input: ".gitkeep",
+    why: "Dotfiles are legal filenames, and a rule rejecting any component that starts with `.` — written to stop `..` — takes them with it.",
+    correct:
+      "Accept. `.` and `..` are the two special components; nothing else beginning with a dot is.",
+  },
+]);
+
+// ---------------------------------------------------------------------------
+// template-render — a renderer deciding what markup a value becomes
+// ---------------------------------------------------------------------------
+
+const TEMPLATE_RENDER = sinkCases("template-render", [
+  {
+    id: "script-tag",
+    direction: "hostile",
+    input: "<script>alert(1)</script>",
+    why: "The canonical case, and the one every deny-list is written against — which is exactly why it is a poor test on its own.",
+    correct:
+      "HTML-escape at render time so the value renders as text; never insert it as markup.",
+  },
+  {
+    id: "img-onerror",
+    direction: "hostile",
+    input: "<img src=x onerror=alert(1)>",
+    why: "Executes without the string `script` appearing anywhere, so a deny-list keyed on `<script>` passes it through.",
+    correct:
+      "Escape rather than filter. An allow-list of tags, if markup is genuinely wanted, must allow-list attributes too.",
+  },
+  {
+    id: "attribute-breakout",
+    direction: "hostile",
+    input: '" autofocus onfocus=alert(1) x="',
+    why: 'Escaping chosen for element text does not always neutralise a value landing inside an attribute: the quote closes the attribute and the rest becomes new attributes. The qualifier matters, and it is measured rather than assumed — reading back the attributes an HTML parser actually assigns: a full escaper that also encodes `"` to `&quot;` (`he`, lodash `_.escape`, Handlebars) CONTAINS this inside a QUOTED attribute, leaving `value` the only attribute set. Those same escapers break out of an UNQUOTED attribute, where `autofocus` and `onfocus` land as new attributes — and so does an escaper handling only `<`, `>` and `&` inside a quoted one.',
+    correct:
+      "Choose the escaping by the position the value lands in — element text, attribute value, URL and script context are four different escapings.",
+  },
+  {
+    id: "javascript-url",
+    direction: "hostile",
+    input: "javascript:alert(1)",
+    why: "Escaping does nothing here because there is no markup to escape — the scheme itself is the payload, and the value is a perfectly well-formed href.",
+    correct:
+      "Allow-list URL schemes (`http`, `https`, `mailto`) for href and src; reject everything else.",
+  },
+  {
+    id: "mustache-interpolation",
+    direction: "hostile",
+    input: "{{constructor.constructor('return process')()}}",
+    why: "Server-side template injection: the value is compiled as template source rather than substituted as data. In an EXPRESSION-EVALUATING renderer (Angular, Vue, Jinja-style) it runs in the renderer's own scope with the renderer's own privileges — measured, the equivalent in a JavaScript template literal returns `process.version`. Logic-less renderers read `{{a.b}}` as a lookup path rather than an expression, and the disagreement between them is measured too: Mustache renders empty, while Handlebars refuses to compile it at all (`Parse error ... Expecting 'ID', got 'INVALID'`). That the same string is remote code execution in one renderer, empty output in a second and a parse error in a third is the reason to test it rather than reason about it.",
+    correct:
+      "Never compile user data as template source. Pass it as a value to an already-compiled template.",
+  },
+  {
+    id: "template-literal",
+    direction: "hostile",
+    input: "${process.env.SECRET}",
+    why: "The same class in JavaScript template literals and expression languages: a value interpolated into code rather than into output reads whatever the surrounding scope can see.",
+    correct:
+      "Never build a template literal or expression from user data; bind it as a parameter.",
+  },
+  {
+    id: "ampersand-text",
+    direction: "legitimate",
+    input: "Tom & Jerry",
+    why: "Must survive. A filter that strips `&` to prevent entity tricks silently corrupts ordinary names, and the corruption is visible only to the reader.",
+    correct:
+      "Escape to `Tom &amp; Jerry` in the markup, which displays as `Tom & Jerry`. Escape, do not strip.",
+  },
+  {
+    id: "angle-in-text",
+    direction: "legitimate",
+    input: "5 < 10",
+    why: "A less-than sign in prose is not markup. Stripping `<` to stop the script tag above also mangles arithmetic, comparisons and generics.",
+    correct: "Escape to `5 &lt; 10`, which displays as `5 < 10`.",
+  },
+  {
+    id: "https-link",
+    direction: "legitimate",
+    input: "https://example.com/a?b=c",
+    why: "The scheme allow-list that stops `javascript:` must still pass this, query string and all. A URL validator strict enough to reject `?b=c` breaks ordinary links.",
+    correct:
+      "Accept and render as a working link, attribute-escaping the value inside the href.",
+  },
+]);
+
+// ---------------------------------------------------------------------------
+// filename — a script deciding WHICH DIRECTORY ENTRY COUNTS, and what it derives
+// ---------------------------------------------------------------------------
+// The through-line: a name is data the shell is eager to re-read as something
+// else — a line, a word, an option, a glob, a command. Cases are MATERIALISED
+// (see MATERIALISED_SINKS): each is written into a fixture directory beside two
+// control gates, and the script under probe (`qa-cycle.sh`-shaped: print the
+// highest gate number in <dir>, refuse rather than guess) is run against the
+// directory. A handled hostile name leaves the high control's value on stdout,
+// exit 0, nothing on stderr, and no side effect; a legitimate name carries a
+// number above the controls and must itself be printed.
+
+const FILENAME = sinkCases("filename", [
+  {
+    id: "newline-in-name",
+    input: "x.gate.5.y\nz.gate.9.w.yml",
+    direction: "hostile",
+    why: "sed and every other line tool work a LINE at a time, so one name yields two extracted values. A script that feeds the pair to arithmetic aborts its loop and prints whatever it had seen so far — a lower, wrong cycle — and exits 0. This is the task.121 defect, reproduced by the finalise DoD probe on the very script that says it refuses rather than guesses.",
+    correct:
+      "Anything not reduced to one run of digits is un-numbered: the entry is ignored, the high control (12) is printed, exit 0, nothing on stderr.",
+    expected: { stdout: "12\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "command-substitution",
+    input: "$(touch PWNED).gate.3.x.yml",
+    direction: "hostile",
+    why: "A name that reaches `eval`, an unquoted `echo $f` inside a `sh -c` string, or any second parse runs the substitution. The number still extracts (3), so stdout looks right — only the marker file betrays it.",
+    correct:
+      "The name is never re-parsed as code; `PWNED` is not created; the entry is numbered 3, below the high control, so 12 is printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "", absent: ["PWNED"] },
+  },
+  {
+    id: "backtick-substitution",
+    input: "`touch PWNED2`.gate.3.x.yml",
+    direction: "hostile",
+    why: "The older substitution syntax, which some quoting that stops `$(...)` does not stop.",
+    correct: "As above: no `PWNED2`, 12 printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "", absent: ["PWNED2"] },
+  },
+  {
+    id: "separators-in-name",
+    input: "a;b|c&d.gate.4.x.yml",
+    direction: "hostile",
+    why: "Every shell separator in one name. A script that word-splits a listing (`for f in $(ls)`) sees four entries, none of them a gate; one that interpolates the name into a command string runs three commands.",
+    correct:
+      "Quoted throughout, the name is one entry numbered 4; 12 is printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "leading-double-dash",
+    input: "--.gate.2.x.yml",
+    direction: "hostile",
+    why: "Passed unquoted or without a `--` guard, a name beginning `--` is read as an option terminator by whatever it is handed to, and the real operand shifts.",
+    correct: "The name is numbered 2 and handled as data; 12 is printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "leading-dash-n",
+    input: "-n.gate.2.x.yml",
+    direction: "hostile",
+    why: '`echo "$name"` swallows it as a flag and prints nothing; a listing built with echo loses the entry silently.',
+    correct: "printf '%s', not echo; the name is numbered 2; 12 is printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "glob-metacharacters",
+    input: "g[1]*.gate.2.x.yml",
+    direction: "hostile",
+    why: "An unquoted expansion re-globs the name against the directory, and `[1]` and `*` match other entries — the loop then processes files that were never listed.",
+    correct: "Quoted, the name is one entry numbered 2; 12 is printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "eleven-digit-run",
+    input: "task.gate.99999999999.x.yml",
+    direction: "hostile",
+    why: "`[ -gt ]` is a 64-bit test that prints 'integer expected' and SKIPS the comparison on a long run of digits, so a script that compared it would exit 0 having never compared — and a script that accepted it would print a number no cycle can be.",
+    correct:
+      "A run longer than nine digits is a malformed name, not a number: un-numbered, ignored; 12 is printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "zero-cycle",
+    input: "task.gate.000.x.yml",
+    direction: "hostile",
+    why: "Normalises to 0, which names no cycle (`qa-gate-0` is not a stage) — a script that took it as current would key every comment to a round that never happened.",
+    correct: "Zero is un-numbered; the entry is ignored; 12 is printed.",
+    expected: { stdout: "12\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "plain",
+    input: "task.121.gate.20.name.yml",
+    direction: "legitimate",
+    why: "The ordinary case, numbered above both controls. A script that only ever printed the control would look correct on every hostile case and be a stub.",
+    correct: "20 is printed, exit 0, nothing on stderr.",
+    expected: { stdout: "20\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "leading-zeros",
+    input: "story.2.1.gate.020.name.yml",
+    direction: "legitimate",
+    why: "Zero-padded numbers are what an author types to keep a listing sorted; refusing them, or comparing them as strings (`020` < `12`), loses the current gate.",
+    correct: "Normalised as base-10: 20 is printed.",
+    expected: { stdout: "20\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "unicode",
+    input: "tâche.121.gate.21.résumé.yml",
+    direction: "legitimate",
+    why: "Non-ASCII bytes in a name are ordinary. A pattern anchored on ASCII, or a locale that cannot collate them, drops the entry.",
+    correct: "21 is printed.",
+    expected: { stdout: "21\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "hyphenated",
+    input: "task.121.gate.22.my-long-name.yml",
+    direction: "legitimate",
+    why: "Hyphens inside the descriptive segment are the naming convention itself; a rule that bans `-` to stop the leading-dash cases above bans every real name.",
+    correct: "22 is printed.",
+    expected: { stdout: "22\n", exit: 0, stderr: "" },
+  },
+  {
+    id: "spaces",
+    input: "task 121.gate.23.name with spaces.yml",
+    direction: "legitimate",
+    why: "Spaces are legal in a name and common in one typed by hand. A listing that is word-split sees five entries and no gate.",
+    correct: "Quoted throughout, one entry: 23 is printed.",
+    expected: { stdout: "23\n", exit: 0, stderr: "" },
+  },
+]);
+
+// ---------------------------------------------------------------------------
+// markdown-structure — a validator deciding whether a report is well-formed
+// ---------------------------------------------------------------------------
+// The document is the input. Its hostile cases are malformed implementation
+// reports — the shapes a spliced, doubled or hand-edited report takes — and a
+// report a pipeline decision then reads as if it were whole. Every case is a
+// minimal valid report with ONE defect, so each trips the one problem code it
+// is named for (`trailing-duplicate-body` also trips `section-duplicated`: a
+// section that reappears after the last one has, by construction, appeared
+// twice). One defect per case is what lets a mutant that drops ONE check
+// reproduce: the task.117 fixture trips five codes, and a validator missing
+// any one of them still refuses it.
+//
+// The legitimate cases are what a correct validator must still accept: fenced
+// examples, CRLF line endings, the optional section, and a section the
+// template does not name. This sink fits validators of THIS document shape —
+// the implementation report — and no other: probing a validator of a different
+// document through it would score these legitimate reports overblocked.
+//
+// Built by plain string concatenation (no template literals): the purity test
+// strips string content before it scans for calls, and a fence inside a
+// template literal would defeat that stripping.
+
+const MD_SECTIONS = Object.freeze([
+  "Summary",
+  "Pipeline Configuration",
+  "Pipeline Progress",
+  "Decisions Log",
+  "Issues Log",
+  "QA Iteration History",
+  "Completion",
+]);
+const mdSection = (name) => "## " + name + "\n\n" + name + " text.\n";
+const mdReport = (header, sections) =>
+  "# Implementation Report: Example\n\n" +
+  header +
+  "\n**Run Number**: 1\n\n---\n\n" +
+  sections.map(mdSection).join("\n");
+const MD_TASK_HEADER = "**Task**: `task.1.example.md`";
+const MD_TASK = mdReport(MD_TASK_HEADER, MD_SECTIONS);
+const MD_FENCED_QUOTE =
+  "\n```markdown\n# Implementation Report: quoted\n\n" +
+  MD_TASK_HEADER +
+  "\n\n## Summary\n```\n";
+const MD_FENCED_ISSUES = MD_TASK.replace(
+  "## Issues Log\n",
+  "```\n## Issues Log\n```\n",
+);
+const crlf = (text) => text.split("\n").join("\r\n");
+
+const MARKDOWN_STRUCTURE = sinkCases("markdown-structure", [
+  {
+    id: "duplicated-header-block",
+    input: MD_TASK.replace(
+      "Summary text.\n",
+      "Summary text.\n\n" + MD_TASK_HEADER + "\n",
+    ),
+    direction: "hostile",
+    why: "A second `**Task**:` header line is the spliced-copy signature: an Edit that doubled the report pasted its opening again. Every section can still be present and in order, so a check that only counts sections accepts it.",
+    correct:
+      "Refused as `header-block-duplicated` — the report is not whole, whatever its sections say.",
+  },
+  {
+    id: "second-h1",
+    input: MD_TASK.replace(
+      "Summary text.\n",
+      "Summary text.\n\n# Implementation Report: Example\n",
+    ),
+    direction: "hostile",
+    why: "A second top-level heading outside a fence means a second document has been spliced in. A reader that takes the first H1 as the title and scans on sees nothing wrong.",
+    correct: "Refused as `multiple-h1`.",
+  },
+  {
+    id: "trailing-duplicate-body",
+    input: MD_TASK + "\n## Completion\n\nSpliced copy.\n",
+    direction: "hostile",
+    why: "A section reappearing after the last one is the tail of a doubled report. A reader that stops at the first `## Completion` reads a clean report; one that reads the last reads the copy.",
+    correct:
+      "Refused as `trailing-duplicate-body` (and `section-duplicated`, which the shape implies).",
+  },
+  {
+    id: "section-out-of-order",
+    input: mdReport(MD_TASK_HEADER, [
+      "Summary",
+      "Pipeline Configuration",
+      "Pipeline Progress",
+      "Issues Log",
+      "Decisions Log",
+      "QA Iteration History",
+      "Completion",
+    ]),
+    direction: "hostile",
+    why: "Every section is present exactly once, so presence and duplicate checks both pass; only the order betrays a hand-reassembled report whose rows may now sit under the wrong heading.",
+    correct: "Refused as `section-out-of-order`.",
+  },
+  {
+    id: "section-duplicated",
+    input: mdReport(MD_TASK_HEADER, [
+      "Summary",
+      "Pipeline Configuration",
+      "Pipeline Progress",
+      "Decisions Log",
+      "Issues Log",
+      "Issues Log",
+      "QA Iteration History",
+      "Completion",
+    ]),
+    direction: "hostile",
+    why: "A section written twice in place: in order, and nothing after the last section. A reader takes one of the two and silently drops the other's rows.",
+    correct: "Refused as `section-duplicated`.",
+  },
+  {
+    id: "heading-only-inside-fence",
+    input: MD_FENCED_ISSUES,
+    direction: "hostile",
+    why: "The required `## Issues Log` exists only inside a fenced block — an example, not a section. A line-grep for the heading finds it and calls the report complete.",
+    correct:
+      "Refused as `section-missing`: a heading inside a fence is not a section.",
+  },
+  {
+    id: "heading-only-inside-fence-crlf",
+    input: crlf(MD_FENCED_ISSUES),
+    direction: "hostile",
+    why: "The same fenced-only section with CRLF line endings. A fence matcher anchored with `$` never sees a fence whose line still ends in `\\r`, so the fenced heading reads as real and the missing section passes — the defect this case found in `report-lint.js` (task.131).",
+    correct: "Refused as `section-missing`, exactly as with LF endings.",
+  },
+  {
+    id: "qa-cycle-duplicated",
+    input: MD_TASK.replace(
+      "QA Iteration History text.\n",
+      "QA Iteration History text.\n\n### QA Cycle 1\n\nFirst.\n\n### QA Cycle 1\n\nAgain.\n",
+    ),
+    direction: "hostile",
+    why: "The same QA cycle heading twice is a cycle recorded twice or a history spliced in; a count of cycles read off the headings is then wrong.",
+    correct: "Refused as `qa-cycle-duplicated`.",
+  },
+  {
+    id: "empty-document",
+    input: "",
+    direction: "hostile",
+    why: "An empty file has no problems to find, so a validator that only reports what it sees returns a clean result for a report that does not exist.",
+    correct:
+      "Refused as `variant-undetected` — nothing identifies it as a report, so nothing can pass it.",
+  },
+  {
+    id: "valid-task-report",
+    input: MD_TASK,
+    direction: "legitimate",
+    why: "The baseline: every required section once, in order. A validator that refuses it refuses every report.",
+    correct: "Accepted — no problems.",
+  },
+  {
+    id: "valid-story-report",
+    input: mdReport("**Story**: `story.1.2.example.md`", MD_SECTIONS),
+    direction: "legitimate",
+    why: "The story variant, told apart only by its header line. A validator hard-wired to `**Task**:` refuses every story report.",
+    correct: "Accepted — the story variant is detected and holds.",
+  },
+  {
+    id: "fenced-quoted-report",
+    input: MD_TASK.replace(
+      "Decisions Log text.\n",
+      "Decisions Log text.\n" + MD_FENCED_QUOTE,
+    ),
+    direction: "legitimate",
+    why: "A Decisions Log legitimately quotes a report — H1, header line, headings — inside a fence. A validator that does not skip fences reads it as a splice.",
+    correct: "Accepted — fenced lines are examples, not structure.",
+  },
+  {
+    id: "fenced-quoted-report-crlf",
+    input: crlf(
+      MD_TASK.replace(
+        "Decisions Log text.\n",
+        "Decisions Log text.\n" + MD_FENCED_QUOTE,
+      ),
+    ),
+    direction: "legitimate",
+    why: "The same quote with CRLF endings — what a Windows checkout with `core.autocrlf` hands the validator. A fence matcher that misses a `\\r`-terminated fence reads the quote as a second H1 and header block and refuses a clean report.",
+    correct: "Accepted, exactly as with LF endings.",
+  },
+  {
+    id: "optional-section-present",
+    input: mdReport(MD_TASK_HEADER, [
+      "Summary",
+      "Pipeline Configuration",
+      "Pipeline Progress",
+      "Decisions Log",
+      "Issues Log",
+      "Tracker Actions Required",
+      "QA Iteration History",
+      "Completion",
+    ]),
+    direction: "legitimate",
+    why: "`## Tracker Actions Required` is optional: present once in its place is valid. A validator that treats the template as a closed list refuses it.",
+    correct: "Accepted — an optional section, once, in order.",
+  },
+  {
+    id: "unnamed-section-after-completion",
+    input:
+      MD_TASK +
+      "\n## Pipeline Paused — 2026-09-30\n\nPaused before compaction.\n",
+    direction: "legitimate",
+    why: "The PreCompact hook appends `## Pipeline Paused — …` after Completion by design. A validator that refuses any heading after the last section refuses every paused run.",
+    correct: "Accepted — sections the template does not name are ignored.",
+  },
+]);
+
+const CORPUS = Object.freeze({
+  "url-authority": URL_AUTHORITY,
+  "sql-orm": SQL_ORM,
+  "shell-exec": SHELL_EXEC,
+  path: PATH,
+  "template-render": TEMPLATE_RENDER,
+  filename: FILENAME,
+  "markdown-structure": MARKDOWN_STRUCTURE,
+});
+
+/**
+ * The frozen cases for one sink.
+ *
+ * An unknown sink THROWS rather than returning `[]`. A typo that returned an
+ * empty array would produce a probe executing zero candidates and reporting no
+ * findings — indistinguishable from a boundary that held, which is the exact
+ * failure the `probes_executed` counter exists to catch. Throwing makes the
+ * typo loud at the call site instead.
+ *
+ * @param {string} sink one of SINKS
+ * @returns {ReadonlyArray<Readonly<object>>} frozen cases, both directions
+ */
+export function corpusFor(sink) {
+  const known = Object.prototype.hasOwnProperty.call(CORPUS, sink);
+  if (!known) {
+    throw new Error(
+      `Unknown sink "${sink}". Known sinks: ${SINKS.join(", ")}. ` +
+        "A sink returning no cases would report a clean probe, so this throws " +
+        "rather than yielding an empty corpus.",
+    );
+  }
+  return CORPUS[sink];
+}
+
+/** Every case across every sink, in SINKS order. Memoised, so the freeze is shared. */
+let _all;
+export function allCases() {
+  return (_all ??= Object.freeze(SINKS.flatMap((sink) => corpusFor(sink))));
+}
+
+// ---------------------------------------------------------------------------
+// Rendering — ONE implementation, used by the prose peer and by its parity test
+// ---------------------------------------------------------------------------
+// security-input-corpus.md's case tables are this function's output, verbatim.
+// The parity test asserts that, so the document cannot drift from the module and
+// there is no second renderer to keep in step. Regenerate the document's
+// "## The cases" body with:
+//
+//   cd shared/resources
+//   node -e 'import("./security-input-corpus.mjs")
+//     .then((m) => process.stdout.write(m.renderCorpusTables()))'
+
+/** Control characters rendered visibly, because a table cannot carry them. */
+const CONTROL = Object.freeze({
+  "\n": "␊",
+  "\r": "␍",
+  "\t": "␉",
+  "\0": "␀",
+});
+
+/**
+ * Render one case's `input` for a markdown table cell — literally, so a reader
+ * sees the bytes the module supplies rather than a JSON-escaped rewrite of them.
+ * Only `|` is escaped (it would end the cell) and control characters are shown
+ * with a visible glyph, which the document's legend names.
+ */
+export function renderInput(input) {
+  if (input === "") return "_(empty string)_";
+  const shown = [...input]
+    .map((ch) => CONTROL[ch] ?? ch)
+    .join("")
+    .replace(/\|/g, "\\|");
+  const fence = shown.includes("`") ? "``" : "`";
+  const pad = shown.startsWith("`") || shown.endsWith("`") ? " " : "";
+  return `${fence}${pad}${shown}${pad}${fence}`;
+}
+
+/**
+ * Escape a prose cell for a markdown table.
+ *
+ * `why` and `correct` are prose ABOUT shell and path syntax, so they quote `|`
+ * routinely — `>|`, `||`. An unescaped one ends the cell and the row renders
+ * with the wrong number of columns. Two rows shipped that way before a
+ * structural check caught it: renderRow escaped the input column and not these.
+ */
+const escapeCell = (text) => text.replace(/\|/g, "\\|");
+
+/** Render one case as its markdown table row. */
+export function renderRow(c) {
+  return `| ${renderInput(c.input)} | ${escapeCell(c.why)} | ${escapeCell(c.correct)} |`;
+}
+
+/** Per-sink prose that heads each table group in the document. */
+const SINK_BLURB = Object.freeze({
+  "url-authority":
+    "A URL or DSN parser deciding **where a connection goes**. The through-line: authority delimiters are silent. A misplaced one does not raise; it re-points the connection and drops whatever followed. Several cases below behave differently in a spec-compliant parser than in a hand-rolled one, and each says which — that difference is itself the hazard.",
+  "sql-orm":
+    "A SQL engine deciding **what statement to run**. Almost every hostile case here has the same `correct` handling — bind the value as a parameter — and that is the point: one control answers the whole class, and hand-written escaping is the defect rather than the fix.",
+  "shell-exec":
+    "A shell deciding **what command to run**. The 27 hostile cases are measured, not invented: 14 from `task.67.bug.3` and 13 from `bug.6`, replayed verbatim in `evals/shared/tests/snippet-classifier-fail-open-replay.test.mjs`. Every one got past a classifier that looked correct on inspection. The common shape: the string a scanner reads is not the command the shell runs.",
+  path: "A filesystem API deciding **which file to open**. Note how many of the hostile cases defeat a check that is lexically correct — the disagreement is between the string and the kernel.",
+  "template-render":
+    "A renderer deciding **what markup a value becomes**. The escaping is not one function: element text, attribute value, URL and script context are four different ones, and choosing by position is the control.",
+  filename:
+    "A script deciding **which directory entry counts**, and what value it derives from a name. These cases are **materialised**: the engine writes each name into a fixture directory beside two control gates (`!.gate.3.control.yml`, `~.gate.12.control.yml`, which bracket every hostile name under `LC_ALL=C`) and runs the script under probe against the directory. A handled hostile name leaves `12` on stdout, exit 0, nothing on stderr and no side effect; a legitimate name is numbered above the controls and must be printed itself. The through-line: a name is data the shell is eager to re-read as a line, a word, an option, a glob or a command.",
+  "markdown-structure":
+    'A validator deciding **whether an implementation report is whole** — the document a pipeline decision then reads. Each hostile case is a minimal valid report with one defect, so each trips the one problem code it is named for (`trailing-duplicate-body` also trips `section-duplicated`, which the shape implies); that is what lets a probe catch a validator missing one check. Probe a `(text, opts)` validator with `--args-json`, e.g. `report-lint.js#lintReport` with `[{"sections": <loadTemplate()>}]`. The legitimate cases are reports a correct validator must still accept — fenced examples, CRLF endings, the optional section, a heading the template does not name — so refusing everything scores `overblocked`. This sink fits validators of the implementation-report shape only: a validator of another document would refuse these legitimate cases for being the wrong document, not for being malformed.',
+});
+
+/**
+ * The document's "## The cases" body, generated from the corpus.
+ *
+ * Pure — returns a string, writes nothing. The counts in each group's heading
+ * are computed here rather than hand-written, so they cannot go stale when a
+ * case is added.
+ */
+export function renderCorpusTables() {
+  let out = "";
+  for (const sink of SINKS) {
+    const cases = corpusFor(sink);
+    const groups = DIRECTIONS.map((d) => [
+      d,
+      cases.filter((c) => c.direction === d),
+    ]);
+    const [[, hostile], [, legit]] = groups;
+    out += `### \`${sink}\`\n\n${SINK_BLURB[sink]}\n\n`;
+    out += `**${hostile.length} hostile, ${legit.length} legitimate.**\n\n`;
+    for (const [direction, group] of groups) {
+      const heading =
+        direction === "hostile"
+          ? "Hostile — must not be accepted"
+          : "Legitimate — must still be accepted";
+      out += `#### ${heading}\n\n`;
+      out +=
+        "| Input | Why | What a correct implementation does |\n|---|---|---|\n";
+      for (const c of group) out += `${renderRow(c)}\n`;
+      out += "\n";
+    }
+  }
+  return out;
+}
+
+export default corpusFor;
