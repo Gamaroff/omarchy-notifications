@@ -46,6 +46,15 @@ GEMINI.md
 
 Add a line for any other agent link a user creates.
 
+### A repo that committed its links
+
+Untrack them in one commit with the `.gitignore` lines: `git rm --cached CLAUDE.md .claude/skills`. The
+local links stay.
+
+Until every branch has that commit, git deletes the local links whenever it moves the checkout between a
+branch that tracks them and one that does not: a switch, a checkout or a fast-forward pull. Recreate them
+with the commands above. It stops once `main` has the commit, at the next release.
+
 ## 3. Installing the guide and the import line
 
 The guide is vendored, not cloned: a release of `Gamaroff/agent-standards` is copied into
