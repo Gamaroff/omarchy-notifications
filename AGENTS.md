@@ -46,13 +46,24 @@ which clones the repo into `~/.config/omarchy/plugins/gamaroff.notifications`, a
 `omarchy plugin update`. Remove with `omarchy plugin remove gamaroff.notifications`. Needs `jq` and
 `inotifywait`, which Omarchy ships.
 
-On this machine `~/.config/omarchy/plugins/gamaroff.notifications` is a symlink to this repo, so the
-working tree here is the running copy (see Gotchas).
+On the owner's machine it is installed the same way, with
+`omarchy plugin add git@github.com:Gamaroff/omarchy-notifications.git`. Omarchy keeps its own git checkout
+at `~/.config/omarchy/plugins/gamaroff.notifications`, and `omarchy plugin update` fast-forwards it to the
+remote default branch, `main`. Only released code runs. The dev clone `~/Development/omarchy-notifications`
+is never the running copy: develop and switch branches there freely.
+
+- The widget sits in the bar's center section, at index 5, with its own `mutedNotifications` setting in
+  `~/.config/omarchy/shell.json` (managed by chezmoi). `omarchy plugin enable` keeps the position but drops
+  the setting; `chezmoi apply ~/.config/omarchy/shell.json` puts it back.
+- The `omarchy plugin` commands fail with "omarchy-shell is not responding" under the default 2s IPC
+  timeout. Run them with `OMARCHY_SHELL_IPC_TIMEOUT=20s`.
 
 ## Releases
 
 - Version file: `manifest.json` (`version`).
-- Post-release step: none.
+- Pushing `main` is what ships: the next `omarchy plugin update` picks it up.
+- Post-release step: `omarchy plugin update gamaroff.notifications`, then `omarchy-restart-shell` (the shell
+  caches QML).
 
 ## Gotchas
 
@@ -85,11 +96,10 @@ QML and JavaScript:
 - No grouping, on purpose: ten identical notifications are ten cards.
 - The panel is pinned to the right edge of the screen, so the bell belongs at the far right of the bar.
 
-Settings and the running copy:
+Settings and validation:
 
 - A setting is defined in `manifest.json` (defaults and schema) and described in the README settings
   table. Change both together.
-- Because the installed plugin is a symlink to this repo, switching branches or editing files changes
-  what the shell runs.
-- `omarchy plugin validate .` fails in this checkout: Omarchy forbids symlinks inside a plugin folder, and
-  the local agent links (`CLAUDE.md`, `.claude/skills`) are symlinks. A fresh clone does not have them.
+- `omarchy plugin validate .` fails in the dev clone: Omarchy forbids symlinks inside a plugin folder, and
+  the local agent links (`CLAUDE.md`, `.claude/skills`) are symlinks. A fresh clone, including Omarchy's
+  installed checkout, does not have them; validate one of those instead.
