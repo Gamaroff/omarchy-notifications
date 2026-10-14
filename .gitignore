@@ -5,3 +5,7 @@
 archive.jsonl
 *.jsonl
 *.local.*
+# Agent standards: worktrees and local agent links (.agents/standards/docs/development/agents/agent-files.md)
+.worktrees/
+CLAUDE.md
+.claude/skills

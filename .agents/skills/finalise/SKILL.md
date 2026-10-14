@@ -1,0 +1,3031 @@
+---
+name: finalise
+description: Verify story/task completion against comprehensive Definition of Done criteria (acceptance criteria, tests, code reviews, documentation, security review, compliance check), then update status to 'accepted' and generate Sprint Review artifacts, or list gaps if incomplete. Use when finalising stories or tasks for Sprint Review. `--bug` runs the same DoD as a fix-evidence check over a bug report — skip list stated once, no Change Log row, no `accepted`, no sprint review — for develop-bug Step 7.
+---
+
+> **Status lifecycle**: see [`references/document-status-lifecycle.md`](references/document-status-lifecycle.md)
+
+# Finalise Story/Task
+
+## Overview
+
+Mark a story or task as complete by verifying it against a comprehensive Definition of Done (DoD) checklist. This skill automates the verification of acceptance criteria, unit tests, code reviews, documentation updates, security reviews, and compliance checks. A **bug report** is finalised in **bug mode** (`/finalise --bug <bug-file>`): the same DoD run as a fix-evidence check, with the story/task-shaped steps skipped by a list stated once — see § "Document kind — story, task, or bug" below.
+
+**Parallel DoD Verification Approach:** This skill dispatches four read-only Explore subagents in a single parallel message to perform DoD checks (AC traceability, security, compliance, docs/changelog). Each agent returns a structured YAML result. Main context writes the DoD running summary in **one consolidated pass per section** after aggregation — not per individual check. This gives:
+
+- ~3–4× wall-clock speedup vs serial verification
+- ≥80% reduction in DoD-summary file writes (≤6 writes vs ~25 baseline)
+- Partial-failure isolation: one failed agent marks that section for manual review; others continue
+- Complete audit trail: each section write contains full evidence citations from the agent YAML
+
+Based on the verification results, it either marks the story/task as "Accepted" with generated artifacts, or lists specific gaps that need to be addressed.
+
+## When to Use This Skill
+
+This skill should be used when:
+
+- A developer believes a story or task is complete and ready for Sprint Review
+- Quality assurance needs to verify DoD compliance before accepting work
+- Product Owner wants to validate that all acceptance criteria have been met
+- A story/task document needs to transition from `code_review` or `testing` status to `accepted`
+- Sprint Review preparation requires a summary of completed work
+
+**Trigger Phrases:**
+
+- "Mark [story/task] as complete"
+- "Verify DoD for story.XXX.Y"
+- "Is story.XXX.Y ready for acceptance?"
+- "Check if task.ZZZ meets Definition of Done"
+- "Prepare story.XXX.Y for Sprint Review"
+
+## Workflow
+
+Follow this systematic workflow to verify and mark a story/task as complete. Steps 3–5 dispatch four parallel Explore subagents; the running summary is written in four consolidated appends after all agents return (Step 3d). Do NOT write incrementally.
+
+### Document kind — story, task, or bug
+
+Resolve the kind **once**, before Step 0, and carry it as `DOC_KIND` (`story` | `task` | `bug`):
+
+```bash
+DOC_KIND=""
+# The invocation's flag is a SUBSTITUTED INPUT, exactly like the path below: a block run
+# through a tool has no positional parameters, so `$*` alone resolved every `/finalise --bug`
+# run to task and then told the agent to pass a flag it had already passed (cycle-5 CR-3).
+# Both are read so a shell that does carry argv (the executed test) still works.
+BUG_FLAG="{--bug when the invocation carried it, else empty}"
+case " $* $BUG_FLAG " in *" --bug "*) DOC_KIND=bug ;; esac
+DOC_FILE="{the document path argument}"
+# Both inputs must be SUBSTITUTED, not left as their placeholders: a verbatim `{…}` is
+# non-empty, cannot match ` --bug `, and its basename takes the `*)` arm — a `--bug` run
+# would continue as a TASK at exit 0, reaching the Change Log writer bug mode forbids.
+# The three Step 7 blocks refuse the same shape (cycle-6 CR-3); this block decides the
+# kind for all of them, so it refuses first (TASK-125-BUG-20).
+case "$BUG_FLAG$DOC_FILE" in *'{'*) echo "HALT: BUG_FLAG or DOC_FILE is an unsubstituted placeholder — substitute both before running the Document-kind block"; exit 1 ;; esac
+if [ -z "$DOC_KIND" ]; then
+  case "$(basename "$DOC_FILE")" in
+    story.*) DOC_KIND=story ;;
+    task.*)  DOC_KIND=task ;;
+    # Anything else — a general bug `bug.{N}.{name}.md` run without the flag —
+    # continues as a TASK: that is the DoD every such run took before task.125,
+    # and a kind this prose never defines is not a kind (TASK-125-BUG-5).
+    *)       DOC_KIND=task ;;
+  esac
+  # A bug report's filename is `bug.{N}.{name}.md`, `story.{e}.{s}.bug.{N}.{name}.md` or
+  # `task.{id}.bug.{N}.{name}.md` — the `.bug.{N}.` segment is what a story/task file never has.
+  if printf '%s' "$(basename "$DOC_FILE")" | grep -qE '(^|\.)bug\.[0-9]+\.'; then
+    echo "hint: $(basename "$DOC_FILE") is a bug report — run \`/finalise --bug $DOC_FILE\` for the fix-evidence DoD; continuing in $DOC_KIND mode as invoked"
+  fi
+fi
+```
+
+**`--bug` is opt-in, and the hint is all the path check does.** `/finalise <bug-file>` without the
+flag continues to do what it did before — the story/task DoD — so nothing that calls this skill
+today changes behaviour; only `develop-bug` Step 7 Part A passes the flag. The hint exists because
+every real bug run before task.125 took the "inline DoD fallback" and hand-wrote the same file
+(bug.13, bug.14 — obs #69): a mode a reader has to know about is a mode that does not get used.
+
+#### What bug mode runs and skips
+
+The whole difference between a story/task run and a bug run is this table. Each row's key appears
+**exactly once** in the prose below as `**Bug mode (\`key\`):** skip …` or `**Bug mode (\`key\`):**
+run …`, beside the step it governs, and `evals/shared/tests/finalise-bug-mode.test.mjs` asserts the
+table and the markers agree in both directions — a step skipped here and not marked in the prose, or
+marked in the prose and not listed here, is red. Stating the skips once is what makes "does this
+apply to a bug?" a lookup instead of a judgement.
+
+| Key | Step | story / task | bug |
+| --- | --- | --- | --- |
+| `running-summary` | Step 0 — running summary file | run | run — `{bug-prefix}.dod.{N}.{name}.md` from `assets/bug-dod-template.md` |
+| `verification-complete` | Step 7.1 — the `## Verification Complete` block | run — append | run — **fill** the template's block in place; never append a second heading |
+| `read-document` | Step 1 — read the document | run | run — the bug report, frontmatter or header block (`references/bug-doc.js`) |
+| `qa-reports` | Step 2 — QA reports and gate | run | run — globs scoped to `${STEM}` (a co-located bug must not read its parent's); none expected; the verify loop's `#### QA Verification` and the implementation report are the QA record |
+| `ac-agent` | Step 3b — AC traceability agent | run | **skip** — a bug has no ACs; the `fix-evidence` agent takes its slot |
+| `fix-evidence` | Step 3b — fix-evidence agent | — | run — `references/finalise-dod-fix-evidence-prompt.md` |
+| `frontmatter-accepted` | Step 7.2 — `status: accepted` | run | **skip** — `accepted` is not a bug status; develop-bug Part B writes `closed` |
+| `change-log-row` | Step 7.3 — Change Log acceptance row | run | **skip — forbidden** — bug reports never carry a Change Log (`references/document-change-log.md` §Exclusions) |
+| `status-history-row` | Step 7.3 — Status History row | — | run — `references/status-history.js`, the bug counterpart of `change-log.js` |
+| `registry-tick` | Step 7.4 — task registry tick | run | run — called unconditionally; answers `not-a-task` and writes nothing |
+| `body-dod-section` | Step 7.4–7.5 — DoD section in the document body | run | **skip** — the bug's closing record is `## Resolution Summary`, written by develop-bug Part B |
+| `sprint-review` | Step 7.6 — sprint review summary | run | **skip** — a bug fix is reported through its Resolution Summary and the registry |
+| `acceptance-commit` | Step 7.6a — acceptance commit + push | run | run — stages the DoD file and the bug report (its Status History row); no sprint review |
+| `pushed-assertions` | Step 7.6b — tracked-and-pushed | run | run — the DoD file and the bug report; no `status: accepted` assertion |
+| `ci-reading-2` | Step 7.6c — CI reading 2 | run | run |
+| `pr-comment` | Step 7.7 — canonical PR comment | run | run — `DOD_PATH` on `${STEM}`, `FINAL_GATE` from the verify-loop verdict |
+| `tracker-done` | Step 7.8 — tracker comment, close, board `done` | run | run — one writer; develop-bug Part B4 verifies rather than repeats |
+| `gaps-verification-complete` | Step 8.1 — the `## Verification Complete` block | run — append | run — **fill** via `fill-verification-complete.sh` with `gaps`; the gaps go under `## Step 5` `**Outcome:**` as `- [ ]` lines |
+| `gaps-change-log-row` | Step 8.3 — Change Log gaps row | run | **skip — forbidden** — same grounds as `change-log-row` |
+| `gaps-status-history-row` | Step 8.3 — Status History row | — | run — `status-history.js`, status unchanged, notes `DoD incomplete — N gap(s) — {dod file}` |
+| `gaps-body-section` | Step 8.4 — gap report in the document body | run | **skip** — the gap report lives in the DoD file; a body section is a second verdict |
+| `gaps-pr-comment` | Step 8.5 — gaps PR comment | run | run — `GAP_REPORT_BODY` from the DoD file's `## Step 5: Acceptance Decision`, not the bug body |
+
+A skipped step logs `skipped — bug mode (\`key\`)` in the running summary's Verification Complete
+block, so the file says which steps did not run and why, rather than reading as if they never existed.
+
+### Step 0: Initialize Task List and Create Running Summary File
+
+Before starting any verification, create a task list to track every sub-step to completion, then create the running summary file.
+
+**CRITICAL — Task List Initialization:**
+
+Use `TaskCreate` to register every sub-step you will execute. This prevents skipping steps. Create one task per action item below, then mark each `in_progress` before starting it and `completed` immediately after finishing it.
+
+**Tasks to create at the start (use TaskCreate for each):**
+
+| Task Subject                    | Description                                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Read story document             | Locate and parse the story/task markdown file                                                     |
+| Review QA reports               | Find and read QA report and gate files in story directory                                         |
+| Dispatch parallel DoD checks    | Fan out 4 Explore subagents simultaneously: AC traceability, security, compliance, docs/changelog |
+| Aggregate DoD results           | Parse 4 YAML responses; flag agent failures as NEEDS_MANUAL_REVIEW                                |
+| Write consolidated DoD sections | One append per section (AC, security, compliance, docs) to running summary                        |
+| Make acceptance decision        | Evaluate all checks and decide ACCEPT or GAPS                                                     |
+| Update story document           | Add DoD section (accepted or gap report) to story file                                            |
+| Update frontmatter              | Change status, updated, completed_date fields (accepted path only)                                |
+| Generate Sprint Review summary  | Create sprint-review-summary.md from template (accepted path only)                                |
+| Post PR comment                 | Post acceptance or gap comment to GitHub PR                                                       |
+| Update running summary          | Finalize story.{epic}.{story}.dod.{num}.{name}.md with outcome                                    |
+| Communicate to user             | Output final result block to user                                                                 |
+
+Create all tasks upfront, then work through them in order. Do NOT skip any task.
+
+---
+
+Before starting any verification, also create a co-located running summary file to track results incrementally.
+
+**Actions:**
+
+1. **Determine story/task directory:**
+   - Extract directory path from the story/task file path provided
+   - Example: `${PRD_ROOT}/.../story.311.1.example-system/`
+
+2. **Create running summary file:**
+   - File name format (stories): `story.{epic}.{story}.dod.{num}.{story-name}.md` — `{num}` is computed below, never counted by eye
+   - File name format (tasks): `task.{id}.dod.{num}.{task-name}.md`
+   - File name format (bugs): `{bug-prefix}.dod.{num}.{bug-name}.md` — the prefix is the bug id `bug-doc.js` reports (`bug.13`, `story.7.4.bug.4`, `task.67.bug.3`)
+   - Full path: `{story-directory}/story.{epic}.{story}.dod.{num}.{story-name}.md`
+   - Compute `{num}`, from the repository root:
+
+     ```bash
+     STEM="{story.{epic}.{story} | task.{id} | bug mode: the bug prefix, e.g. task.67.bug.3}"   # the work item's filename stem
+     source .agents/skills/finalise/references/newest-numbered.sh || exit 1
+     DOD_N=$(next_numbered "{document-directory}" dod -name "${STEM}.dod.*.md") || exit 1
+     ```
+
+     and use `$DOD_N` as `{num}`. It is the highest existing `{num}` plus 1 (1 when there is none), never the number of reports plus 1: a directory holding `.1.` and `.3.` gets `.4.`, where a count would overwrite `.3.`. `next_numbered`'s header in the sourced file states the full rule (obs #272, task.186).
+   - Initialize with header and timestamp
+
+3. **Write initial content:**
+
+   ```markdown
+   # Definition of Done Verification
+
+   **Story/Task:** {story-name}
+   **Verification Started:** {current-date-time}
+
+   ---
+
+   ## Verification Results
+
+   _DoD results will be appended here in 4 consolidated sections after parallel agent completion._
+
+   ---
+   ```
+
+4. **Use Write tool to create the file**
+
+**Bug mode (`running-summary`):** run — create the file from `assets/bug-dod-template.md` instead of the header above: its header block (Bug, Verification Started, PR, Mode) replaces the story/task one, and Steps 3d and 7 fill its `{placeholders}` section by section. The template is the shape bug.13 and bug.14's hand-written DoDs converged on, lifted rather than designed; it carries no `**Status:**` header line for the same reason the story/task header does not.
+
+> **The header carries no `**Status:**` line, and that is deliberate (task.115, obs #57).** This
+> file's status is written exactly once, as `**Final Status:**` in the `## Verification Complete`
+> section that Step 7 or Step 8 appends. It used to open `**Status:** IN PROGRESS` as well, with
+> the instruction to flip it sitting ~740 lines away at Step 7 — and on task.106 the header was
+> missed and the file was posted to the PR verbatim, reading `IN PROGRESS` above a lead that said
+> "no further action is needed". A status that lives in one place cannot contradict itself. The
+> both-locations rule in `references/document-status-lifecycle.md` is for the *work item's*
+> frontmatter and body; the DoD summary is a report and gets one status line, at the end.
+
+**Example:**
+
+If verifying `${PRD_ROOT}/.../story.311.1.example-system/story.311.1.example-system.md`, create:
+
+`${PRD_ROOT}/.../story.311.1.example-system/story.311.1.dod.1.example-system.md`
+
+### Step 1: Locate and Read the Story/Task Document
+
+Accept the story/task document path in one of these formats:
+
+**Full path to markdown file:**
+
+```
+${PRD_ROOT}/ui-domain/module-name/epics/epic.311.example-integration/stories/story.311.1.example-system/story.311.1.example-system.md
+```
+
+**Directory path (skill will find the .md file):**
+
+```
+${PRD_ROOT}/ui-domain/module-name/epics/epic.311.example-integration/stories/story.311.1.example-system/
+```
+
+**Task path examples:**
+
+```
+docs/tasks/task.90.swagger-cli-plugin-enablement/task.90.swagger-cli-plugin-enablement.md
+docs/tasks/task.90.swagger-cli-plugin-enablement/
+```
+
+**Actions:**
+
+1. If given a directory path, use Glob to find the `.md` file: `{directory}/*.md`
+2. Read the story/task document using the Read tool
+3. Parse YAML frontmatter to extract current status and metadata
+4. Extract acceptance criteria, PR references, and documentation notes from the body
+
+**Bug mode (`read-document`):** run — the document is a bug report, and it comes in two shapes: YAML frontmatter, or a `**Bug ID**:` / `**Status**:` header block with no frontmatter at all. Read it through `node references/bug-doc.js --file "$DOC_FILE"` (the same reader `ensure-bug-github-issue` and the syncs use) rather than by frontmatter grep; the JSON carries `mode`, `bug_id`, `github_issue` / `jira_key`, and `fields.status` / `fields.severity` / `fields.priority` (merged across both shapes). It carries **no** `pr_number`: `PR_NUMBER` comes from Step 3a's resolver, which reads a bug's branch exactly as it reads a task's. There are no acceptance criteria to extract — the bug's one "criterion" is its `**Expected Behavior**` line, which the fix-evidence agent reads.
+
+### Step 2: Check for and Review QA Reports
+
+Before proceeding with manual DoD verification, check if QA reports and gate files exist in the story/task directory. These provide comprehensive quality assessments that inform the finalisation decision.
+
+**Actions:**
+
+1. **Search for QA Reports and Gate Files:**
+   - Use Glob to find QA report files: `{story-directory}/*.qa.*.md`
+   - Use Glob to find gate files: `{story-directory}/*.gate.*.yml`
+   - If multiple reports exist, review the most recent one (highest number in filename)
+
+   **Bug mode (`qa-reports`):** run — but **scope both globs to the bug's own stem**:
+   `{story-directory}/${STEM}.qa.*.md` and `{story-directory}/${STEM}.gate.*.yml`, where `STEM` is
+   the bug prefix `bug-doc.js` reports (`bug.13`, `story.7.4.bug.4`, `task.67.bug.3`). A story or
+   task bug lives in its **parent's** directory, and the directory-wide globs above return the
+   parent's `task.67.qa.1` / `task.67.gate.2` — another work item's QA record, not the bug's
+   (TASK-125-BUG-9). Expect **none**: the develop-bug verify loop writes no gate, so `qa-cycle.sh`
+   refuses on it and the stem-scoped glob matches nothing. That is the normal case, not a gap. The
+   QA record is the bug file's `#### QA Verification` on its last iteration
+   (`**Verification Result**: ✅ Fixed`) and the implementation report's `## QA Iteration History`
+   — whose last `**Verdict**:` line 6b derives for itself, in its own block; summarise both in the
+   template's Step 1 block. When a bug's **own** stem *does* match a QA report or gate
+   (a task bug reviewed with `/qa-task`), read it exactly as on the story/task path.
+
+2. **Ignore prior-run acceptance blocks in the document body — they are history, not evidence.**
+
+   A story/task that was accepted once and later reopened still carries its previous
+   `## Definition of Done - PASSED ✅` / `**Status:** ACCEPTED` section verbatim in the body. This
+   skill reads those sections, so unless they are explicitly discounted, the previous run's verdict
+   is silently re-used as though it were this run's.
+
+   ```bash
+   # How many acceptance blocks does the body already contain?
+   PRIOR_DOD=$(grep -cE '^## Definition of Done.*(PASSED|✅)' "$DOC_FILE" 2>/dev/null || echo 0)
+   ```
+
+   If `PRIOR_DOD` is greater than zero **and** the document's current `status:` is not `accepted`
+   (i.e. it was reopened), then:
+   - Treat **every** existing DoD/ACCEPTED block as **superseded**. Verify each criterion afresh
+     against the code — do not inherit a single ✅ from it.
+   - Confirm the block is visibly marked as historical (e.g. retitled `— run N (historical,
+superseded)`). If it is not, that is itself a finding: an unmarked stale PASS banner is a trap
+     for the next reader and for the next `/finalise` run.
+   - Scope this run's verdict to a **new** `dod.{N}` file. Never edit a previous run's DoD summary.
+
+   > Observed live: task.52 was accepted (DoD 7/7), reopened the same day with an eighth criterion,
+   > and its run-1 `PASSED ✅ / ACCEPTED` banner was still sitting in the body. Criteria counts differ
+   > between runs, so inheriting the old block would have declared 7/7 complete against a bar that
+   > now had 8 items — and the eighth was the entire reason for the reopen.
+
+3. **Read and Analyze QA Reports (if found):**
+   - Read the QA report markdown file
+   - Extract key information:
+     - **Gate Status**: PASS/FAIL/CONCERNS/WAIVED
+     - **Acceptance Criteria Coverage**: Which ACs are complete, ready, or have gaps
+     - **Test Execution Status**: Unit/integration/load/performance test status
+     - **NFR Validation**: Security, performance, reliability, maintainability assessments
+     - **Quality Score**: Overall quality rating
+     - **Issues Found**: Critical, major, or minor issues identified
+     - **Recommendations**: Immediate actions, future improvements
+     - **Deployment Readiness**: Staging/production approval status
+
+4. **Read and Analyze Gate Files (if found):**
+   - Read the gate YAML file
+   - Parse key fields:
+     - `gate`: PASS/FAIL/CONCERNS/WAIVED
+     - `status_reason`: Why the gate passed or failed
+     - `top_issues[]`: Blocking issues list
+     - `waiver.active`: Whether issues were waived
+     - `quality_score`: Numeric quality assessment
+     - `evidence.trace.ac_covered[]`: Which ACs are covered
+     - `evidence.trace.ac_gaps[]`: Which ACs have gaps
+     - `evidence.trace.ac_implementation_status[]`: Detailed AC status
+     - `nfr_validation`: Security, performance, reliability, maintainability status
+     - `recommendations.immediate[]`: Blocking issues requiring fixes
+     - `recommendations.future[]`: Non-blocking improvements
+     - `deployment_readiness`: Staging/production conditions
+     - `test_execution_status`: Test suite creation and execution status
+
+5. **Use QA Information to Inform DoD Decision:**
+   - **If gate status is PASS:**
+     - Verify that all acceptance criteria are marked as covered
+     - Check that NFR validations all show PASS status
+     - Confirm no immediate recommendations exist
+     - Verify test execution status is acceptable (tests created and passing)
+     - Use QA report findings to supplement manual verification
+
+   - **If gate status is FAIL:**
+     - Review `top_issues[]` and `recommendations.immediate[]`
+     - These are blocking issues that MUST be addressed before acceptance
+     - Include these gaps in the final gap report (Step 7)
+     - DO NOT mark story as accepted
+
+   - **If gate status is CONCERNS:**
+     - Review concerns listed in `status_reason` and recommendations
+     - Determine if concerns are blocking or can be addressed post-acceptance
+     - Use judgment to decide if story can be accepted with conditions
+
+   - **If gate status is WAIVED:**
+     - Check `waiver.active` and understand why issues were waived
+     - Verify waiver is appropriate and documented
+     - Consider waived issues in acceptance decision
+     - **Show the waiver in the DoD file**, beside the gate status, as one line —
+       `**Waiver**: {waiver.reason} — approved by {waiver.approved_by}`. A pipeline step skipped with
+       `--skip` (task.201) reaches the DoD only through this line, so a reader of the DoD or its PR
+       comment sees the skip rather than a gate that merely reads `WAIVED`. A waiver with no
+       `approved_by` is not documented: list it as a DoD gap.
+
+6. **Document QA Report Findings:**
+   - If QA reports exist, reference them in the final DoD verification section
+   - Include gate status, quality score, and key findings
+   - Link to QA report and gate files in the acceptance documentation
+
+**Example QA Report Discovery:**
+
+```markdown
+### QA Reports Found ✅
+
+**QA Report**: `story.309.2.2C.qa.1.initial-review.md`
+**Gate File**: `story.309.2.2C.gate.1.initial-review.yml`
+
+**Gate Status**: PASS ✅
+**Quality Score**: 90/100 (EXCELLENT)
+**Status Reason**: Excellent implementation with production-ready health monitoring, comprehensive test suites, and thorough documentation.
+
+**Acceptance Criteria Coverage**:
+
+- AC1: ✅ COMPLETE - Provider registration implemented
+- AC2: ✅ COMPLETE - Health monitoring implemented
+- AC3: ⚠️ READY - Integration tests created, pending environment setup
+- AC4: ⚠️ READY - Performance tests created, baseline pending execution
+- AC5: ⚠️ READY - Load tests created, pending environment setup
+
+**NFR Validation**:
+
+- Security: ✅ PASS
+- Performance: ✅ PASS
+- Reliability: ✅ PASS
+- Maintainability: ✅ PASS
+
+**Deployment Readiness**:
+
+- Staging: ✅ APPROVED
+- Production: ⚠️ CONDITIONAL (pending staging validation)
+
+**Immediate Actions**: None (no blocking issues)
+**Future Actions**: 6 recommendations for post-deployment improvements
+```
+
+**If No QA Reports Found:**
+
+- Proceed with manual DoD verification (Steps 3-5)
+- Note in running summary that no QA reports were available
+- Manual verification becomes primary source of acceptance decision
+
+6. **Write QA Report Findings to Running Summary:**
+   - Use Edit tool to append QA findings to the running summary file
+   - If QA reports found, write gate status, quality score, AC coverage, NFR status
+   - If no QA reports found, write "No QA reports found - proceeding with manual verification"
+
+   **Example append (QA reports found):**
+
+   ```markdown
+   ## Step 1: QA Report Review ✅
+
+   **QA Report Found:** `story.309.2.2C.qa.1.initial-review.md`
+   **Gate File Found:** `story.309.2.2C.gate.1.initial-review.yml`
+
+   **Gate Status:** ✅ PASS
+   **Quality Score:** 90/100 (EXCELLENT)
+
+   **Acceptance Criteria Coverage (from QA):**
+
+   - AC1: ✅ COMPLETE
+   - AC2: ✅ COMPLETE
+   - AC3: ⚠️ READY (tests created, pending execution)
+
+   **NFR Validation (from QA):**
+
+   - Security: ✅ PASS
+   - Performance: ✅ PASS
+   - Reliability: ✅ PASS
+   - Maintainability: ✅ PASS
+
+   **Immediate Actions from QA:** None (no blocking issues)
+   **Future Actions from QA:** 6 post-deployment recommendations
+
+   ---
+   ```
+
+   **Example append (no QA reports):**
+
+   ```markdown
+   ## Step 1: QA Report Review ⚠️
+
+   **QA Reports:** No QA reports or gate files found in story directory.
+   **Manual Verification:** Proceeding with manual DoD verification for all criteria.
+
+   ---
+   ```
+
+### Steps 3–5: Parallel DoD Checks (4 Explore Subagents)
+
+**Overview**: Dispatch four read-only Explore subagents in a **single parallel message** (4 simultaneous Agent tool calls). Each agent performs one DoD domain check and returns a structured YAML result. Main context writes the DoD running summary in **one consolidated append per section** after aggregation.
+
+**Mark the wait on the pipeline lock** beside the dispatch — `bash .agents/skills/finalise/references/set-waiting-on.sh "step-7 DoD checks (4 agents)"` — and `… --clear` once all four results are aggregated (source: `references/set-waiting-on.sh`; task.124, obs #89). Inside a `/develop-*` pipeline a turn yielded while the agents run is a wait the Stop hook would otherwise re-prompt as a stall; standalone there is no lock and both calls are silent no-ops.
+
+**QA report integration**: If QA reports were found in Step 2, include their findings as supplementary context when building the prompts below (paste relevant QA YAML sections). The subagents use QA findings to inform citations.
+
+---
+
+#### Step 3a: Prepare Shared Context
+
+Collect these values before dispatching:
+
+```bash
+# The PR this run judges — from the branch or the pipeline lock before the document (task 175).
+# Exit 1 (no source names one) leaves PR_NUMBER empty; the agents report pr_status NOT_FOUND.
+PR_JSON=$(bash .agents/skills/finalise/references/resolve-pr-number.sh --doc {story-file} --json)
+PR_NUMBER=$(printf '%s' "$PR_JSON" | jq -r '.pr // empty')
+PR_SOURCE=$(printf '%s' "$PR_JSON" | jq -r '.source // "none"')
+
+# Story type
+STORY_TYPE=$(grep '^type:' {story-file} | awk '{print $(2)}' | tr -d '"')
+[ -z "$STORY_TYPE" ] && STORY_TYPE="task"
+
+# Git diff for AC agent (best-effort — empty diff is handled gracefully by the agent)
+DIFF_FILE=".claude/state/pr-diff-$(date +%s).diff"
+[ -n "$PR_NUMBER" ] && gh pr diff "$PR_NUMBER" > "$DIFF_FILE" 2>/dev/null \
+  || git diff HEAD~1 HEAD > "$DIFF_FILE" 2>/dev/null || touch "$DIFF_FILE"
+```
+
+**The PR number comes from `references/resolve-pr-number.sh`, never from the document body.** It
+reads, first answer wins: an explicit `--pr`, the PR whose head is the current branch (`pr-read.sh`),
+the pipeline lock's `pr_url` when the lock is for this document's directory, frontmatter
+`pr_number:`, and a body `PR #N` only when PR N's head branch is the current branch. A task document
+cites other work's PRs, and the old first-match-in-the-body rule judged one of them on three runs
+(task.146 → #472, task.147 → #207, task.166 → #505; obs #184). Step 3a passes no `--pr`: finalise
+takes no PR argument, and inside a pipeline the branch rung answers. Record
+`**PR:** #{PR_NUMBER} (source: {PR_SOURCE})` in the running summary's Step 2 block — or
+`**PR:** unresolved (no branch PR, lock, frontmatter or confirmed citation)` when `PR_NUMBER` is empty.
+
+#### Step 3b: Dispatch 4 Explore Subagents in Parallel
+
+**CRITICAL**: Send all 4 Agent tool calls in a **single message**. Do not send them sequentially.
+
+Read each prompt file to get the template, substitute the placeholder values, then dispatch:
+
+| Agent                | Prompt file                                    | Key substitutions                                            |
+| -------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
+| 1. AC traceability   | `references/finalise-dod-ac-prompt.md`         | `<STORY_FILE>`, `<PR_NUMBER>`, `<STORY_TYPE>`, `<DIFF_FILE>` |
+| 2. Security review   | `references/finalise-dod-security-prompt.md`   | `<STORY_FILE>`, `<STORY_TYPE>`, `<DOD_N>` (Step 0's `$DOD_N`) |
+| 3. Compliance review | `references/finalise-dod-compliance-prompt.md` | `<STORY_FILE>`                                               |
+| 4. Docs & changelog  | `references/finalise-dod-docs-prompt.md`       | `<STORY_FILE>`, `<PR_NUMBER>`, `<STORY_TYPE>`                |
+
+Each agent returns YAML. Capture: `AC_RESULT`, `SECURITY_RESULT`, `COMPLIANCE_RESULT`, `DOCS_RESULT`.
+
+**Bug mode (`ac-agent`):** skip — a bug report has no acceptance criteria, so agent 1's prompt has nothing to trace. Its slot is taken by the fix-evidence agent below; still four agents, still one message.
+
+**Bug mode (`fix-evidence`):** run — dispatch `references/finalise-dod-fix-evidence-prompt.md` as agent 1 with `<BUG_FILE>`, `<PR_NUMBER>`, `<DIFF_FILE>` and `<IMPL_REPORT>` (the newest implementation report beside the bug in **either** shape the pipeline has written — `{bug-prefix}.implementation.*.md` or `{bug-prefix}.{name}.implementation.*.md`, the two prefixes `references/bug-doc.js` accepts (TASK-125-BUG-13) — or empty). It checks the five things a bug fix must show — the expected behaviour is implemented, a regression test asserts it *and runs per PR*, the test is recorded red without the fix, a new guard states its scope, bundled copies match their source — and returns `fix_evidence:` YAML in the same PASS/FAIL-with-citation contract as `ac_traceability:`. Capture it **as `AC_RESULT`** so Steps 3c–6 read one variable: `AC_OVERALL` is `fix_evidence.overall`, and the Step 6 column "All Acceptance Criteria Met?" reads "all fix-evidence checks PASS". `STORY_TYPE` is `bug` for the other three agents, which need no bug variant.
+
+> **The security agent's evidence lands in the work-item directory before Step 3d.** The run record
+> (`{stem}.dod.{N}.security.run.json` and its `.d/`) and any cases file
+> (`{stem}.dod.{N}.security.cases.json`), both numbered by this run's `$DOD_N` (obs #302), must be under the work-item directory, because the 6a
+> acceptance commit carries them. A read-only agent may report that it wrote them elsewhere. Copy
+> them in from the paths it returns, and treat a `--cases-file` it ran but did not save as
+> `probes_executed` that cannot be re-run: re-dispatch once, asking for the file (obs #299).
+
+> **When the record is still absent, `/finalise` runs the probe itself (obs #10).** A read-only
+> agent may refuse to create the engine's sandbox or its record. It then returns `probes_executed: 0`,
+> the `probe mode executed no candidates` FAIL and its `probe_command`. That FAIL describes the agent's
+> tool class, not the boundary. On task.201 it would have reached Step 6 as a security FAIL on a
+> boundary that held (72 executed, 0 reproduced). Before Step 3c, when `boundary: true` and this run's
+> `${STEM}.dod.${DOD_N}.security.run.json` is in neither the work-item directory nor a path the agent
+> returned:
+>
+> 1. **Cases.** If `probe_command` passes `--cases-file` and that file is absent, write the agent's
+>    `probe_cases` to it, under the work-item directory. With neither, re-dispatch once, asking for them.
+> 2. **Run.** First check that the command's `--record` is this run's record path in the work-item
+>    directory. Correct a command that records anywhere else; do not run it as given. Then run it from
+>    the repository root.
+> 3. **Replace, from the record.** Set `probes_executed` to its `totals.executed`. Rebuild `probes[]`
+>    from the engine's `cases[]`, keeping each whose outcome differs from its direction, with its input
+>    verbatim. When the count is non-zero, drop the agent's `probe mode executed no candidates` check.
+>    Recompute `overall` from what remains: FAIL if any check or general check FAILs or any probe
+>    reproduced, otherwise PASS. A rebuilt probe carries **no `severity`**, so Step 8a reads it as not-low and halts.
+>    Re-dispatch the agent with the record path if you want it graded.
+> 4. **Say so.** Add `- Probe run by /finalise — the security agent could not execute it` under the
+>    security section's Probe Results.
+>
+> A zero from this run still takes the zero-guard: then the engine declined the entry, which is the
+> guard's real case. With no `probe_command` either, the zero-guard stands and the section is
+> re-dispatched once.
+
+> **`SECURITY_RESULT` carries a `boundary:` flag and, when it is true, `probes_executed:` and `probes[]`.**
+> `boundary: true` means the security agent's Step 1b identified a **boundary deliverable** — a predicate,
+> validator, classifier or allow/deny-list — and it then generated candidate inputs, **executed** them
+> against the shipped code, and reported only those that reproduced. `boundary: false` means the rule did
+> not fire, which is the common and expected case. `boundary: internal` means the rule fired on a
+> validator of the pipeline's own artefact that no corpus sink models — a recorded decision with an
+> `internal_reason`, rendered as an explicit skip, never as the zero-guard FAIL and never as `false`.
+>
+> **Read `probes` together with `probes_executed`, never alone.** No reproduced probe with a high
+> `probes_executed` is the *good* outcome — the boundary was probed and held. No reproduced probe with
+> `probes_executed: 0` **or absent** is a **finding**, not a pass: the agent emits a `probe mode
+> executed no candidates` FAIL in `checks`, rendered like any other failed check. Branching on list
+> emptiness alone would report the best outcome and the worst one identically.
+>
+> **Four absences are four different things, and none of them is `false`.** A missing `boundary`
+> means the agent did not answer the question — render it as unverified, never as "not a boundary". A
+> missing `probes_executed` under `boundary: true` counts as zero, because a count that was never
+> reported is not evidence that work happened. A `boundary: internal` with no `internal_reason` is a
+> FAIL — the reason is the whole of that decision, and without it the skip is indistinguishable from a
+> probe nobody ran. And the held-case branch keys on *no probe having reproduced*, not on the list
+> being empty — an entry carrying `reproduced: false` must not be able to suppress the verdict line by
+> making the list non-empty. See `references/finalise-dod-security-prompt.md`.
+
+#### Step 3c: Aggregate Results
+
+After all 4 agents complete, parse each YAML result. Handle agent failures:
+
+- **Agent returns valid YAML**: extract `overall` field → `AC_OVERALL`, `SEC_OVERALL`, `COMP_OVERALL`, `DOCS_OVERALL`
+- **`boundary: internal` forces `SEC_OVERALL = FAIL` unless its `internal_reason` holds**, whatever the
+  agent's own `overall` says. It holds when it is present and not whitespace-only, **begins with the
+  entry as `path#export`**, and that entry is **not** in the prompt's *Entries disqualified from
+  `internal`* table — matched on file basename plus export, so a full or bundled path to a listed file
+still matches; an entry a sink models is probed, never skipped. A reason that fails any of the
+  three is the self-report the zero-guard exists to refuse, and Step 6 decides on `SEC_OVERALL`, not on
+  the rendered summary (task.131 QA cycles 1–2, TASK-131-BUG-2 and BUG-3). The agent should already
+  have emitted the `internal boundary recorded without a reason` FAIL check; this override is what
+  holds when it did not.
+- **Agent errors or returns unparseable output**: set that section's overall to `NEEDS_MANUAL_REVIEW`; mark section for manual verification in the DoD running summary; continue with remaining sections
+
+**Never abort due to a single agent failure.** One failed section = manual review for that section only.
+
+#### Step 3d: Write Consolidated DoD Running Summary Sections
+
+Append sections to the running summary file. **One append per section** — not per individual check. Use the Edit tool four times (one per section).
+
+**Append 1 — AC & PR section** (from `AC_RESULT`; in bug mode this is the template's `## Step 2: Fix Evidence (the bug's "acceptance criteria")` block, one `####` per `fix_evidence.checks[]` entry, and its `### Documentation` list from `fix_evidence.docs[]`):
+
+```markdown
+## Step 2: Core Acceptance Criteria & PR Review
+
+**Overall AC Status:** {AC_OVERALL — ✅ PASS | ❌ FAIL | ⚠️ PARTIAL | 🔍 NEEDS_MANUAL_REVIEW}
+**PR Status:** {ac_result.pr_status} (PR #{PR_NUMBER})
+**PR Review Decision:** {ac_result.pr_review_decision}
+
+### Acceptance Criteria
+
+{for each ac in ac_result.acs:}
+
+#### {ac.ac_id}: {ac.description}
+
+**Status:** {✅ PASS | ❌ FAIL}
+
+- Code evidence: `{ac.code_citation or "not found — FAIL"}`
+- Test evidence: `{ac.test_citation or "not found — FAIL"}`
+  {ac.note ? "- Note: " + ac.note : ""}
+  {endfor}
+
+### Documentation
+
+{for each item in ac_result.docs:}
+
+- **{item.item}**: {✅ PASS | ❌ FAIL | ⚠️ NOT_APPLICABLE}{item.citation ? " — `" + item.citation + "`" : ""}{item.note ? " — " + item.note : ""}
+  {endfor}
+
+**Agent summary:** {ac_result.summary}
+
+---
+```
+
+**Append 2 — Security section** (from `SECURITY_RESULT`):
+
+```markdown
+## Step 3: Security Review
+
+**Story Type:** {security_result.story_type}
+**Overall Security Status:** {SEC_OVERALL — ✅ PASS | ❌ FAIL | ⚠️ NOT_APPLICABLE | 🔍 NEEDS_MANUAL_REVIEW}
+
+{for each check in security_result.checks:}
+
+### {check.check}
+
+**Status:** {✅ PASS | ❌ FAIL | ⚠️ NOT_APPLICABLE}
+{check.citation ? "- Evidence: `" + check.citation + "`" : "- No citation found"}
+{check.note ? "- Note: " + check.note : ""}
+{endfor}
+
+### General Security
+
+{for each check in security_result.general:}
+
+- **{check.check}**: {✅ PASS | ❌ FAIL}{check.citation ? " — `" + check.citation + "`" : ""}{check.note ? " — " + check.note : ""}
+  {endfor}
+
+### Probe Results
+
+{if security_result.boundary is absent, or is neither a boolean nor "internal":}
+⚠️ **The security agent reported no boundary decision.** This is not the same as "not a boundary" —
+the question was not answered, so probe mode is **unverified**. Treat it as a finding and re-run the
+agent; do not read it as a skip.
+{else if security_result.boundary == false:}
+_Probe mode did not fire — the deliverable is not a boundary._
+{else if security_result.boundary == "internal":}
+{if security_result.internal_reason is absent, whitespace-only, does not begin with a path#export entry, or names an entry the prompt disqualifies:}
+❌ **Internal artefact recorded without a valid reason.** `boundary: internal` names no entry, no
+reason no sink fits, or an entry a sink already models — a FAIL (Step 3c forced `SEC_OVERALL` to FAIL):
+the reason is the whole of the decision.
+{else:}
+⚠️ **Internal artefact — not probeable by the engine**: {security_result.internal_reason}. A recorded
+decision, not the zero-guard: no corpus sink models this input.
+{endif}
+{else:}
+**Candidates executed:** {security_result.probes_executed, or "not reported" if absent} — **reproduced:** {count of security_result.probes where reproduced == true}
+
+{if any probe in security_result.probes has reproduced == true:}
+{for each probe in security_result.probes where probe.reproduced:}
+- `{probe.input}` — expected **{probe.expected}**, got **{probe.actual}**
+{endfor}
+{endif}
+
+{if security_result.probes_executed is absent or == 0:}
+❌ **Probe mode executed no candidates.** A boundary was identified but nothing was run — this is a
+finding, not a pass. See the `probe mode executed no candidates` check above. An **absent**
+`probes_executed` counts as zero here: a count that was never reported is not evidence that work
+happened.
+
+When the engine declined the entry (`entry-not-probeable`, or no form reaches it), only two
+remedies clear this guard: (1) make the entry reachable — export it, make the script sourceable, or
+add an engine form — then re-probe; (2) a recorded human override. A by-hand probe (the probe
+boundary rule's §5.1) is evidence for that override, labelled so, never a closure (obs #232).
+{else if no probe in security_result.probes has reproduced == true:}
+✅ **The boundary held** — every candidate returned its expected verdict.
+{endif}
+{endif}
+
+<!--
+  The ✅/❌ pair is an if/else-if, so at most one verdict line is ever emitted. Written as two
+  independent `{if}` blocks, the state `probes_executed: 0` with nothing reproduced rendered BOTH
+  "executed no candidates" and "the boundary held" — asserting that every candidate passed when none
+  had run.
+
+  The findings list is separate and unconditional, so it renders whenever anything reproduced. That
+  means the ❌ callout can legitimately sit ABOVE a findings list, in the contradictory-input case
+  where an agent reports reproduced probes and a zero count; the callout is the warning about the
+  count, not a claim that the list is empty. The ✅ line, by contrast, is suppressed whenever
+  anything reproduced — it can only appear when the count is non-zero and nothing was found.
+-->
+
+**Agent summary:** {security_result.summary}
+
+---
+```
+
+**Append 3 — Compliance section** (from `COMPLIANCE_RESULT`):
+
+```markdown
+## Step 4: Compliance Review
+
+**Overall Compliance Status:** {COMP_OVERALL — ✅ PASS | ❌ FAIL | ⚠️ NOT_APPLICABLE | 🔍 NEEDS_MANUAL_REVIEW}
+**Applicable areas:** {list areas where value is true from compliance_result.applicable_areas, or "None — NOT_APPLICABLE"}
+
+{for each check in compliance_result.checks:}
+
+### {check.area}: {check.check}
+
+**Status:** {✅ PASS | ❌ FAIL | ⚠️ NOT_APPLICABLE}
+{check.citation ? "- Evidence: `" + check.citation + "`" : "- No citation found"}
+{check.note ? "- Note: " + check.note : ""}
+{endfor}
+
+**Agent summary:** {compliance_result.summary}
+
+---
+```
+
+**Append 4 — Docs section** (from `DOCS_RESULT`):
+
+```markdown
+## Step 4b: Docs & Changelog
+
+**Overall Docs Status:** {DOCS_OVERALL — ✅ PASS | ❌ FAIL | ⚠️ NOT_APPLICABLE | 🔍 NEEDS_MANUAL_REVIEW}
+
+{for each item in docs_result.checks:}
+
+### {item.item}
+
+**Status:** {✅ PASS | ❌ FAIL | ⚠️ NOT_APPLICABLE}
+{item.citation ? "- Evidence: `" + item.citation + "`" : "- No citation found"}
+{item.note ? "- Note: " + item.note : ""}
+{endfor}
+
+**Agent summary:** {docs_result.summary}
+
+---
+```
+
+#### Step 3e: Clean Up and Proceed
+
+```bash
+rm -f "$DIFF_FILE"
+```
+
+After all 4 appends are complete, proceed directly to Step 6 (Make Acceptance Decision). The decision logic uses `AC_OVERALL`, `SEC_OVERALL`, `COMP_OVERALL`, and `DOCS_OVERALL`.
+
+**Idempotent re-run**: If the running summary already contains any of the `## Step 2:`, `## Step 3:`, `## Step 4:`, or `## Step 4b:` section headers (from a previous run), **skip** the corresponding append and reuse the existing content. This prevents duplicate sections on re-run.
+
+### Step 6: Make Acceptance Decision
+
+Use the **Decision Matrix** from `references/definition-of-done-checklist.md` to determine if the story/task should be marked as "Accepted" or remain "In Progress".
+
+**Decision Logic:**
+
+| All Acceptance Criteria Met? | Tests & PR Approved? | Docs Updated? | Security Passed? | Compliance Passed? | QA Gate Status? | **Decision**                                                                                                                                  |
+| ---------------------------- | -------------------- | ------------- | ---------------- | ------------------ | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| ✅ Yes                       | ✅ Yes               | ✅ Yes        | ✅ Yes           | ✅ Yes             | ✅ PASS or N/A  | **ACCEPTED** ✅ — _only if `CI_ROLLUP` is `SUCCESS`; see "CI status is a DoD gate" below_                                                     |
+| -                            | -                    | -             | -                | -                  | -               | **IN PROGRESS** if `CI_ROLLUP` is `FAILURE` or `PENDING` (resolve `CANCELLED`/`NONE` by re-sampling first — they are undecided, not verdicts) |
+| ❌ No                        | -                    | -             | -                | -                  | -               | **IN PROGRESS** (list gaps)                                                                                                                   |
+| ✅ Yes                       | ❌ No                | -             | -                | -                  | -               | **IN PROGRESS** (list gaps)                                                                                                                   |
+| ✅ Yes                       | ✅ Yes               | ❌ No         | -                | -                  | -               | **IN PROGRESS** (list gaps)                                                                                                                   |
+| ✅ Yes                       | ✅ Yes               | ✅ Yes        | ❌ No            | -                  | -               | **IN PROGRESS** (list gaps)                                                                                                                   |
+| ✅ Yes                       | ✅ Yes               | ✅ Yes        | ✅ Yes           | ❌ No              | -               | **IN PROGRESS** (list gaps)                                                                                                                   |
+| ✅ Yes                       | ✅ Yes               | ✅ Yes        | ✅ Yes           | ✅ Yes             | ❌ FAIL         | **IN PROGRESS** (QA gate failed)                                                                                                              |
+| ✅ Yes                       | ✅ Yes               | exactly **one** of these four is ❌, on a finding this run produced by execution, and `finalise-fix-and-recheck.mjs` exits 0 on it | | | ✅ PASS or N/A | **FIX-AND-RECHECK** → Step 8a, once; then re-enter this table on the fix head |
+
+> **The FIX-AND-RECHECK row is reachable only through the evaluator, never through judgement.**
+> Its five preconditions — `severity-low`, `single-commit`, `inside-files-summary`,
+> `mutation-proved`, `no-other-finding-open` — are defined once, in
+> `references/finalise-fix-and-recheck-preconditions.json`, and
+> `references/finalise-fix-and-recheck.mjs` is what reads them: exit 0 is the row above, exit 1 is
+> the ordinary IN PROGRESS row for that section with the failed preconditions named in the gap
+> report. A finding with no `severity` is **not** low. The row exists because task.121's finalise
+> security agent reproduced a one-line fail-closed defect in the script the task delivered, and the
+> run had no sanctioned exit but "accept" or "halt a hands-free pipeline for a human" — it fixed
+> the defect inline and recorded a deviation (obs #121). Medium and high findings, and anything
+> the evaluator refuses, halt exactly as before. See Step 8a.
+
+**QA Gate Integration:**
+
+- **If QA gate status is PASS**: Proceed with acceptance if all other criteria are met
+- **If QA gate status is FAIL**: Do NOT accept the story, even if manual checks pass. Review `top_issues[]` and `recommendations.immediate[]` for blocking issues.
+- **If QA gate status is CONCERNS**: Use judgment - review concerns and determine if they are blocking or can be addressed post-acceptance
+- **If QA gate status is WAIVED**: Check that waiver is properly documented and justified, then proceed based on other criteria
+- **If no QA gate exists**: Rely solely on DoD verification from Steps 3–5 parallel checks
+- **If any section has `NEEDS_MANUAL_REVIEW`**: Do NOT accept — treat as a gap and list it in the blocking issues
+
+**Mapping parallel check results to the decision matrix:**
+
+| Decision matrix column       | Source variable                                     |
+| ---------------------------- | --------------------------------------------------- |
+| All Acceptance Criteria Met? | `AC_OVERALL` (PASS/PARTIAL/FAIL)                    |
+| Tests & PR Approved?         | `ac_result.pr_review_decision` (APPROVED)           |
+| **CI green?**                | **`CI_ROLLUP` (see below) — a hard blocker**        |
+| Docs Updated?                | `DOCS_OVERALL` (PASS/NOT_APPLICABLE counts as pass) |
+| Security Passed?             | `SEC_OVERALL` (PASS/NOT_APPLICABLE counts as pass)  |
+| Compliance Passed?           | `COMP_OVERALL` (PASS/NOT_APPLICABLE counts as pass) |
+
+**When the host requires no reviews** (`pr_review_decision` is `null`, as on a single-maintainer
+repo), the "Tests & PR Approved?" column is satisfied by the newest co-located `*.pr-review.*.md`
+(the pipeline's Step 5c `/review-pr` report) with verdict APPROVE or CONCERNS, cited by path in the
+DoD. A `null` decision with no such report is a gap (obs #253).
+
+### CI status is a DoD gate — check it, do not assume it
+
+**A PR being _approved_ is not the same as a PR being _green_.** Review approval is a human
+judgement about the diff; the check rollup is a machine result about the code. This skill used to
+read the first and never the second, which meant it could — and did — mark work `accepted` while its
+CI was still running, on a job that then failed. Acceptance had to be withdrawn by hand afterwards.
+
+Read the rollup before deciding:
+
+**Branch on the platform first.** `$PLATFORM`/`$VCS` is already resolved by
+`references/resolve-platform.sh`. The rollup query below is **GitHub-only** — `gh pr view` against a
+Bitbucket remote fails, which resolves to `UNKNOWN`, which this gate treats as `PENDING`. Read
+literally on a Bitbucket repo that means **`/finalise` can never accept anything**, which is not the
+intent: the gate exists to stop a _pending_ build being rounded up to green, not to make acceptance
+unreachable on half the platforms this skill supports. Use the Bitbucket branch below instead.
+
+#### GitHub (`PLATFORM=github`)
+
+```bash
+# Prefer the rollup (covers checks AND commit statuses); fall back to `gh pr checks`.
+#
+# The rollup mixes two node types with DIFFERENT field sets, and normalising them is
+# the whole difficulty:
+#   • CheckRun (GitHub Actions job) — `.status` (QUEUED|IN_PROGRESS|COMPLETED) + `.conclusion`
+#   • StatusContext (commit status)  — `.state` only, no `.status`/`.conclusion`
+#
+# DO NOT write `.conclusion // .state`. While a CheckRun is running GitHub returns
+# `conclusion: ""` — an EMPTY STRING, not null — and jq's `//` only falls through on
+# `null`/`false`. So `""` is taken as a real value, matches none of the PENDING tokens,
+# and drops to `else "SUCCESS"`: a still-running job is reported as green. That is the
+# exact bug this block previously had, verified live against a queued `portal-e2e`.
+#
+# The reliable discriminator is `.status`: a CheckRun is only decided at COMPLETED.
+#
+# CANCELLED is deliberately NOT bucketed with FAILURE. On a repo whose workflow sets
+# `concurrency: cancel-in-progress: true`, every push cancels the previous run, so a
+# rollup sampled in that window legitimately contains CANCELLED entries that say nothing
+# about the code. Treating them as FAILURE blocks acceptance on healthy work — the mirror
+# of the bug this gate exists to prevent, and just as wrong. CANCELLED means UNDECIDED:
+# resample.
+CI_ROLLUP=$(gh pr view "$PR_NUMBER" --json statusCheckRollup \
+  -q '[ .statusCheckRollup[]
+        | (.status // "") as $st
+        | (if   $st == ""          then (.state // "")        # StatusContext
+           elif $st == "COMPLETED" then (.conclusion // "")   # finished CheckRun
+           else "PENDING" end)                                 # QUEUED/IN_PROGRESS/WAITING
+        | if . == "" then "PENDING" else . end ]               # empty ⇒ undecided, never green
+      | if length == 0 then "NONE"
+        elif any(. == "FAILURE" or . == "TIMED_OUT" or . == "ERROR"
+                 or . == "STARTUP_FAILURE" or . == "ACTION_REQUIRED") then "FAILURE"
+        elif any(. == "PENDING" or . == "EXPECTED" or . == "QUEUED"
+                 or . == "IN_PROGRESS" or . == "WAITING") then "PENDING"
+        elif any(. == "CANCELLED") then "CANCELLED"
+        else "SUCCESS" end' 2>/dev/null || echo "UNKNOWN")
+# How many checks that reading was green over. Reading 2's poll uses it as a floor: a fresh push
+# registers its fast lanes first, and a rollup that is SUCCESS across three checks while the slow
+# lanes have not yet appeared is not a decision (obs #87). Record it beside CI_ROLLUP.
+# DISTINCT checks (a CheckRun's name, a StatusContext's context), never rollup entries: one check
+# can be listed twice, and a floor counted in entries could never be met by a head that listed it
+# once — the poll then ran out its whole MAX_WAIT on a green head (obs #3, PR #625). The poll's
+# checks() below uses the same query, so the floor and the reading count one unit.
+CI_CHECKS_1=$(gh pr view "$PR_NUMBER" --json statusCheckRollup -q '[.statusCheckRollup[] | (.name // .context // "")] | unique | length' 2>/dev/null || echo 0)
+```
+
+#### Bitbucket (`PLATFORM=bitbucket`)
+
+Bitbucket has no rollup. Read the pipeline for the PR's head commit, and **check the HTTP status
+before reading the body** — that is the whole difficulty here, for the reason below.
+
+```bash
+BB_API="https://api.bitbucket.org/2.0"
+HEAD_SHA=$(git rev-parse HEAD)
+# Capture body AND status separately. `curl -s` alone cannot tell 403 from 200-with-no-results.
+#
+# bitbucket-auth.sh picks Bearer or Basic by variable name and fails non-zero
+# when neither is set. Skip the call entirely in that case: an unauthenticated
+# request would come back 404 and read as "no pipelines" — the same trap the
+# 403 branch below exists for.
+if source references/bitbucket-auth.sh; then
+  BB_CODE=$(curl -s -o /tmp/bb-pipelines.json -w '%{http_code}' "${BB_CURL_AUTH[@]}" \
+    "${BB_API}/repositories/${BB_WORKSPACE}/${BB_REPO}/pipelines/?sort=-created_on&pagelen=20")
+else
+  BB_CODE="000"   # no credential — falls into the UNKNOWN branch below, never "NONE"
+fi
+
+if [ "$BB_CODE" = "403" ]; then
+  # NOT "no CI". The token lacks read:pipeline:bitbucket. Every other call can
+  # succeed on the same credential, so nothing else looks wrong.
+  CI_ROLLUP="UNKNOWN"
+elif [ "$BB_CODE" != "200" ]; then
+  CI_ROLLUP="UNKNOWN"
+else
+  CI_ROLLUP=$(python3 -c '
+import json,sys
+sha=sys.argv[1]
+runs=[p for p in json.load(open("/tmp/bb-pipelines.json")).get("values",[])
+      if (p.get("target") or {}).get("commit",{}).get("hash","").startswith(sha[:12])]
+if not runs: print("NONE"); raise SystemExit
+st=[(r.get("state") or {}) for r in runs]
+names={s.get("name") for s in st}
+res={((s.get("result") or {}).get("name") or "") for s in st}
+if "IN_PROGRESS" in names or "PENDING" in names: print("PENDING")
+elif "FAILED" in res or "ERROR" in res:          print("FAILURE")
+elif "STOPPED" in res:                            print("CANCELLED")
+elif "SUCCESSFUL" in res:                         print("SUCCESS")
+else:                                             print("PENDING")
+' "$HEAD_SHA")
+fi
+```
+
+The same `NONE`/`CANCELLED`/`UNKNOWN` re-sampling loop below applies unchanged.
+
+> **A 403 here is the trap, and it has caught two stories.** Bitbucket answers `403` on
+> `/pipelines/` when the token lacks `read:pipeline:bitbucket`, and the commit-status endpoint
+> returns an **empty list** rather than an error. Meanwhile the repository root and the
+> pull-request endpoints keep answering `200` on the same credential, so the token looks entirely
+> healthy. The result is indistinguishable from a repository that simply has no CI configured.
+>
+> Observed live (rebirth-wallet, stories 3.2 and 3.3, 2026-08-05 and 2026-08-08) — diagnosed
+> independently both times, because nothing in the output says "scope". **Never infer CI presence
+> from an empty list; infer it from the status code.** On `UNKNOWN`, record the reason in the DoD
+> summary — "unverified: token lacks `read:pipeline:bitbucket`" is actionable, "no CI found" sends
+> the next reader hunting for a missing pipeline that exists.
+>
+> Where CI runs a command that can also be run locally, a maintainer may accept on that evidence —
+> but it must be recorded as **unverified**, never rounded up to `SUCCESS`, and the residual gap
+> named. That judgement belongs to a human, not to this gate.
+
+`SKIPPED` and `NEUTRAL` conclusions intentionally fall into the `SUCCESS` bucket — a skipped job
+(e.g. a `paths:`-filtered `smoke`) is not a failure and never becomes one.
+
+**Resolve undecided states before deciding — do not conclude from a single sample.** `NONE` and
+`CANCELLED` are both transient on an active PR: a push that supersedes a run leaves the rollup
+momentarily empty, then briefly cancelled, before the replacement run registers. Re-sample:
+
+```bash
+# Re-sample undecided states rather than concluding from one reading.
+for attempt in 1 2 3 4 5; do
+  case "$CI_ROLLUP" in
+    NONE|CANCELLED|UNKNOWN) sleep 20; CI_ROLLUP=$( ...rerun the query above... ) ;;
+    *) break ;;
+  esac
+done
+```
+
+**A docs-only tail is not a reason to wait again (task.172).** If `CI_ROLLUP` is still `PENDING` or
+`NONE` once the re-sample loop has run, ask the tree-equivalence engine whether every file changed
+since a green first-parent ancestor is documentation. It exits **0 for `tree-equivalent` and for
+nothing else** — every other answer, including a failed read, exits 1 — so this `if` cannot round a
+"no" up to green.
+
+**This call costs whatever `ci.docsOnly.checkCommand` costs (obs #262).** When that key is set, the
+engine runs the command before it answers — often minutes, longer than a tool call's timeout. Run
+the block backgrounded with its result written to a file you read on a later turn, as the Step 7.6c
+poll does; or re-sample the head's rollup once more first and call the engine only if it is still
+`PENDING`/`NONE`:
+
+```bash
+# INPUTS, re-bound in THIS block (a fresh shell has none): the rollup read above and the PR number.
+# Unbound, the rule would be skipped silently and the wait would run as if it did not exist.
+: "${CI_ROLLUP:?bind CI_ROLLUP from the rollup read above}" "${PR_NUMBER:?bind PR_NUMBER}"
+CI_TREE_EQ=""
+case "$CI_ROLLUP" in
+  PENDING|NONE)
+    if TE=$(command node .agents/skills/finalise/references/ci-tree-equivalence.js \
+              --head-rollup "$CI_ROLLUP" --head "$(git rev-parse HEAD)" --pr "$PR_NUMBER" --json); then
+      CI_TREE_EQ=$(printf '%s' "$TE" | jq -r '.greenSha[0:12] // empty')
+      [ -n "$CI_TREE_EQ" ] && CI_ROLLUP=SUCCESS    # an empty sha stays PENDING: fail closed
+    fi ;;
+esac
+```
+
+The engine decides on four things and this step re-derives none of them: the head's rollup is
+`PENDING`/`NONE`; a first-parent ancestor has a green rollup **of its own checks**; every file changed
+since it matches `ci.docsOnly.patterns` (default `**/*.md`, `docs/**`), with a change to `skills-config.yaml`
+or to a submodule pointer never counting as docs; and `ci.docsOnly.checkCommand`, when configured, passes
+(bounded by `ci.docsOnly.checkTimeoutSeconds`). Four things make it stricter than this head reduction, on
+purpose: an ancestor with **any** skipped or neutral check is `NONE`, not green (a paths-filter job can
+succeed while its tests are skipped); an ancestor must have **settled**, its newest check at least
+`ci.docsOnly.settleSeconds` old (a push registers its fast lanes first, so a green read in the first minutes
+can be a partial rollup); a nearer docs-only ancestor that is **red** stops the walk instead of being walked
+past; and `--head` must be the checked-out `HEAD`, because the local check runs in the working tree. The
+configuration itself is read from the commit judged, never the working tree, and a malformed one is a usage
+error (exit 2), not the defaults. `FAILURE`, `CANCELLED` and `UNKNOWN` heads never reach it. Switch the rule off
+with `ci.docsOnly.enabled: false` ([`docs/reference/configuration.md`](../../docs/reference/configuration.md)).
+**A `SUCCESS` reached this way is never recorded as plain `SUCCESS`** — see the table.
+
+| `CI_ROLLUP` | Decision                                                                                                                                                                                                                                                                                                |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SUCCESS`   | Proceed — CI column passes. When `CI_TREE_EQ` is set the head's own CI has **not** finished and the reading is satisfied by the docs-only rule above: record `CI reading 1: SUCCESS (tree-equivalent to {CI_TREE_EQ}) @ {CI_HEAD_1}`, never plain `SUCCESS`                                                                                                                                                                                                                                                                              |
+| `FAILURE`   | **Do NOT accept.** Gap: "CI is red on {failing job(s)} — acceptance requires a green run on a commit containing the final code." **One exception, and it is narrow:** a red on the docs link checker alone, reproduced by `doc-links.js` on the work item's own document and/or its co-located `.md` pipeline artifacts and nowhere else, is a Docs-section finding that Step 8a may fix and recheck once — see the clause under *When this step applies* there. Every other red is this row. |
+| `PENDING`   | **Do NOT accept** — unless the tree-equivalence arm above returned `tree-equivalent` (then it is the `SUCCESS` row). Gap: "CI has not finished. Re-run `/finalise` once it completes." **Waiting is the correct action; assuming is not.**                                                                                                                                                                |
+| `CANCELLED` | **Undecided, not failed.** Almost always `cancel-in-progress` superseding a run. Re-sample; if it persists after the retries, check whether a newer commit has its own run and resolve against **that** head. Never record it as a red verdict.                                                         |
+| `NONE`      | **Undecided.** Re-sample first — an empty rollup is the normal state for the seconds between a push and its run registering. Only if it persists does it mean no checks are configured, and then record it explicitly in the DoD summary as _unverified by CI_ rather than treating absence as success. |
+| `UNKNOWN`   | Query failed. Treat as `PENDING` — never as success.                                                                                                                                                                                                                                                    |
+
+> **Observed live (tinker-city PR #539).** `/finalise` sampled the rollup once, read `NONE` on a
+> head whose run was mid-cancellation, and recorded "final head unverified by CI" in the DoD
+> summary. The head was in fact fully green minutes later. The note had to be corrected by hand.
+> A single sample of an actively-moving PR is a snapshot of a race, not a verdict.
+
+> **The failure mode this exists to stop** is a _pending_ rollup being read as "nothing wrong yet"
+> and rounded up to acceptance. `PENDING` and `FAILURE` are both non-acceptance; only `SUCCESS`
+> passes. A green on an ancestor commit is evidence about that commit, not this one — except under
+> the one rule above: when every file changed since it is documentation, the engine says so and the
+> record reads `SUCCESS (tree-equivalent to {sha})`, which names the commit CI actually verified.
+> Outside that rule (a code path in the delta, an ancestor whose checks cannot be read, no green
+> ancestor) the head is still `PENDING`, and "docs-only on top of untested code" is said in the DoD
+> summary rather than rounded up.
+
+> **Verify the query, not just the table.** The first version of this gate had the table above
+> exactly right and still accepted on pending CI, because the _query_ silently never produced
+> `PENDING` (see the empty-string note above). If you change this jq, test it against a rollup with
+> a running check — `{"status":"IN_PROGRESS","conclusion":""}` must yield `PENDING`. A gate whose
+> logic is correct but whose input is mis-parsed is worse than no gate, because it reports success.
+>
+> Do not substitute `gh pr checks` output parsing for this: it prints `pending` for a job that is
+> merely _queued behind another job on a serial runner_, which is indistinguishable in its output
+> from one that is running. The rollup's `.status` is the field that actually distinguishes states.
+
+**Actions:**
+
+1. **Use the aggregated results** from Step 3c (`AC_OVERALL`, `SEC_OVERALL`, `COMP_OVERALL`, `DOCS_OVERALL`) — do not re-read the running summary file for this step
+2. **Resolve `CI_ROLLUP`** using the command above, and record the raw per-job conclusions in the DoD running summary so the decision is auditable. **Record the head it was read on** in the same line — `CI_HEAD_1=$(git rev-parse HEAD)` — as `CI reading 1: {CI_ROLLUP} @ {CI_HEAD_1}` — or, when the docs-only arm resolved it, `CI reading 1: SUCCESS (tree-equivalent to {CI_TREE_EQ}) @ {CI_HEAD_1}`. This is the reading that gates the *decision*; it is structurally an ancestor of the commit that will carry the acceptance, and Step 7's publish boundary takes a second reading on that commit before anything leaves the repo (task.115, obs #40).
+3. **Determine pass/fail** for each decision matrix column using the mapping above
+4. **Write the acceptance decision to the running summary:**
+
+   **Example decision append (all criteria met):**
+
+   ```markdown
+   ## Step 5: Acceptance Decision
+
+   **Decision:** ✅ ACCEPTED
+
+   **Summary:**
+
+   - QA Report: ✅ PASS (Quality Score: 90/100)
+   - Acceptance Criteria: ✅ 5/5 complete
+   - PR Review & Tests: ✅ Approved by 2 reviewers, 14 unit tests
+   - Documentation: ✅ API docs and user guide updated
+   - Security Review: ✅ All checks passed
+   - Compliance Review: ✅ GDPR and WCAG AA compliant
+
+   **Outcome:** Story meets all Definition of Done criteria and is ready for acceptance.
+
+   ---
+   ```
+
+   **Example decision append (gaps identified):**
+
+   ```markdown
+   ## Step 5: Acceptance Decision
+
+   **Decision:** ❌ NOT ACCEPTED - GAPS IDENTIFIED
+
+   **Summary:**
+
+   - QA Report: ❌ FAIL (Quality Score: 45/100)
+   - Acceptance Criteria: ⚠️ 4/5 complete (AC3 missing)
+   - PR Review & Tests: ❌ No PR linked
+   - Documentation: ⚠️ API docs missing
+   - Security Review: ❌ 2 critical issues (input validation, password strength)
+   - Compliance Review: ❌ GDPR consent flow missing
+
+   **Blocking Issues:**
+
+   1. QA Gate: FAIL status (3 blocking security issues from QA)
+   2. AC3: Success message not implemented
+   3. No PR number in story document
+   4. Security: Input validation missing for email field (XSS risk)
+   5. Security: Password strength requirements not enforced
+   6. Compliance: GDPR consent flow not implemented
+
+   **Outcome:** Story does NOT meet Definition of Done. Gaps must be addressed before acceptance.
+
+   ---
+   ```
+
+5. **Proceed based on decision:**
+   - If **ALL criteria are met** (including QA gate if present), proceed to Step 7 (Mark as Accepted)
+   - If **ANY criteria are missing** or **QA gate is FAIL**, proceed to Step 8 (Report Gaps)
+
+### Step 7: Mark as Accepted and Generate Artifacts
+
+If all DoD criteria are met, finalize the running summary, update the story/task document, and generate Sprint Review artifacts.
+
+**Actions:**
+
+1. **Finalize Running Summary File:**
+   - Append the `## Verification Complete` section below — its `**Final Status:**` line is the
+     file's **only** status line (the header carries none; see Step 0)
+   - Add timestamp
+
+   **Bug mode (`verification-complete`):** run — **fill**, never append. `assets/bug-dod-template.md`
+   already ends with the block and its `**Final Status:** {…}` placeholder; a verbatim append wrote a
+   second heading and a second status line (task.125 5c CR-2, obs #146). The fill is one bundled
+   helper, shared with 8.1's GAPS path, which takes the verdict as its argument and proves the
+   once-only rule on the file this run wrote — the template alone proving it is what let the doubled
+   file through (task.152, obs #148):
+
+   ```bash
+   DOC_KIND="{story | task | bug — the kind the Document-kind block resolved}"
+   DOD_PATH="{dod-path — the running summary Step 0 created}"
+   case "$DOC_KIND$DOD_PATH" in *'{'*) echo "HALT: DOC_KIND and DOD_PATH must be bound in this block"; exit 1 ;; esac
+   if [ "$DOC_KIND" = "bug" ]; then
+     # One fill, two verdicts (7.1 accepted, 8.1 gaps). Idempotent; refuses a doubled file and a
+     # file that already reads the other verdict.
+     bash .agents/skills/finalise/references/fill-verification-complete.sh "$DOD_PATH" accepted || exit 1
+   fi
+   ```
+
+   **Example final append:**
+
+   ```markdown
+   ## Verification Complete
+
+   **Final Status:** ✅ ACCEPTED
+   **Completion Time:** {current-date-time}
+   **Total Duration:** {duration}
+   **CI reading 1:** {CI_ROLLUP}{ (tree-equivalent to `CI_TREE_EQ`) — only when the docs-only rule resolved it} @ `{CI_HEAD_1}` (the acceptance decision — Step 6)
+   **CI reading 2:** taken on the acceptance commit after this file is committed and pushed; recorded on the PR canonical summary comment and in the implementation report (Step 7 publish boundary)
+
+   **Artifacts Generated:**
+
+   - ✅ Story document updated with DoD verification section
+   - ✅ Sprint Review summary created
+   - Outward side-effects — the PR canonical comment, the tracker comment and close/transition, the board move — fire **after** this file is committed and pushed (Step 7 publish boundary); their outcomes are recorded on the PR canonical comment and in the implementation report's Decisions Log, not here
+
+   **Next Steps:**
+
+   - Story is ready for Sprint Review
+   - No further action required
+   ```
+
+> **Note:** The DoD file is written and committed at 6a, *before* the PR comment, the tracker
+> close and the board move run, so it cannot truthfully carry their outcomes — an earlier template
+> listed them with a `✅` each, which every run either hard-coded or left as a placeholder (obs #81).
+> Local writes are listed with their real outcome; post-boundary outcomes are pointed at, exactly
+> as `CI reading 2` two lines above is.
+
+2. **Update Frontmatter:**
+   - Change `status` to `accepted`
+   - Update `updated` field to current date (YYYY-MM-DD)
+   - Add `completed_date` field with current date
+   - Write `pr_number: {PR_NUMBER}` from Step 3a's resolver; when it resolved none, write no `pr_number:` — never a number copied from the document body (task 175)
+
+   **Example:**
+
+   ```yaml
+   ---
+   status: accepted
+   updated: 2025-02-01
+   completed_date: 2025-02-01
+   pr_number: 789
+   ---
+   ```
+
+   **Bug mode (`frontmatter-accepted`):** skip — `accepted` is not a bug status (the lifecycle is
+   `new → in-progress → ready-for-qa → closed | reopened`), and the bug's terminal write is
+   `status: closed`, made by develop-bug Step 7 Part B **after** this skill returns. Leave the
+   frontmatter and header block untouched; the Status History row in the next item is the only
+   thing this skill writes into a bug report.
+
+3. **Append the acceptance row to `## Change Log`** — in the **same edit** as the frontmatter
+   change above. Acceptance is the single most important event in a document's life; splitting the
+   status write from the log write is how one lands without the other.
+
+   ```markdown
+   | 2026-05-15 | 1.2 | DoD passed — accepted (PR #204) | finalise |
+   ```
+
+   **`/finalise` is the only pipeline writer that bumps `Version`** — bump the **minor**. Every
+   other pipeline row (`develop`, `qa-story`/`qa-task`, `qa-fix`, the tracker syncs) leaves the
+   cell blank, so `Version` tracks document revisions rather than counting pipeline steps.
+   Canonical format: [document-change-log.md](references/document-change-log.md).
+
+   Two constraints on the Description:
+
+   - **Keep the literal `Definition of Done ... PASSED` out of it.** The prior-run idempotence
+     guard greps `^## Definition of Done.*(PASSED|✅)`; a row echoing that phrasing at line start
+     would be miscounted as a completed run.
+   - **Expect a second row from the sync, and do not treat it as a duplicate.** Step 7 re-runs
+     `sync-jira-{story,task}`, which under the narrowed rules writes a row only when it transitions
+     the status — which at acceptance it does. The accepted document ends with
+     `DoD passed — accepted (PR #204)` from `finalise` and `Status → done` from the sync: the local
+     acceptance decision, and the tracker reaching its terminal column.
+
+   **Append through `change-log.js`, never by text search** — the one-liner is in
+   [document-change-log.md § How a writer appends a row](references/document-change-log.md), with
+   `version` set to the bumped minor. It creates the section when the document predates the
+   template (for a task, after `## 11. Rollback Plan`) and cannot land the row inside a fenced
+   example, which a regex did on task.42/43 (obs #113).
+
+   **Bug mode (`change-log-row`):** skip — **forbidden**, not merely inapplicable. Bug reports are
+   barred from carrying a `## Change Log` (`references/document-change-log.md` §Exclusions;
+   `docs/standards/bug-documents.md`), and `change-log.js` has no `bug` anchor — a writer that
+   reaches for it on a bug file appends the one table the standard forbids, to the end of the file.
+   The rollback trigger for this whole mode is "a Change Log row written to a bug report".
+
+   **Bug mode (`status-history-row`):** run — the bug counterpart of the acceptance row is a
+   `## Status History` row, written through the engine that exists for exactly this purpose:
+
+   ```bash
+   node references/status-history.js --file "$DOC_FILE" \
+     --date "$(date -u +%Y-%m-%d)" --status "{the bug's current status, unchanged}" \
+     --changed-by finalise --notes "DoD verified — {bug-prefix}.dod.{N}.{name}.md"
+   ```
+
+   The `--status` is the bug's **current** status, read back from `bug-doc.js` — this row records
+   that the DoD was verified, not a transition; the `closed` transition is Part B's row. Never
+   hand-author the row: the engine is fence-guarded and finds the real table, which a regex did not
+   on the documents whose examples are pictures of one.
+
+4. **Tick the task registry row** — in the same step, for a **task** only.
+
+   `docs/tasks/task-registry.md` carries a Status column per task, and until task.103 nothing wrote
+   it after creation. `/finalise` is that writer, because this is the one moment that already sets
+   the document's `status: accepted`: doing both here is what makes the row and the document unable
+   to disagree by construction, which is a stronger guarantee than detecting a disagreement later.
+
+   ```bash
+   node .agents/skills/finalise/references/registry-tick.js \
+     --file "{document-path}" --json
+   ```
+
+   > Engine source: `references/registry-tick.js` (bundled into each skill as
+   > `references/registry-tick.js`).
+
+   **Call it unconditionally** — do not wrap it in a "is this a task?" check of your own. The CLI
+   reads the document's own `type` and filename stem and returns `not-a-task` for a story, epic or
+   bug run without touching any registry. `/finalise` is shared across document kinds, and a
+   condition the caller has to remember is one that eventually gets forgotten; the guard belongs in
+   the writer, where it is tested.
+
+   Read `reason` from the JSON and log it:
+
+   | `reason` | What it means | What to do |
+   |---|---|---|
+   | `ticked` | The row now reads `accepted` | Nothing |
+   | `already` | The row already read `accepted` | Nothing — this is a re-run |
+   | `not-a-task` | A story / epic / bug run | Nothing — expected on the story path |
+   | `not-accepted` | The document's status is not `accepted` | Investigate — step 2 above should have set it |
+   | `no-registry` | This project keeps no task registry | Nothing |
+   | `no-row` | The registry has no row for this task | **Log it.** CI's drift check will fail on this |
+   | `row-malformed` | The registry has a row for this task, but the parser rejected its shape — `parserReason` and `line` say why and where | **Log it and tick by hand.** Fix the row's shape so the next tick works |
+   | `ambiguous-row` | The Status column could not be identified | **Log it and tick by hand** |
+   | `engine-unavailable` | The registry parser could not be located | **Log it and tick by hand** |
+
+   **Every outcome exits 0 — never block acceptance on it.** The work is finished by the time this
+   runs, and refusing to finalise a complete task because its index line could not be found trades a
+   cosmetic defect for a stuck pipeline. The loud backstop is
+   `evals/shared/tests/task-registry-drift.test.mjs`, which fails CI whenever a row and its document
+   disagree, so a no-op here is caught there.
+
+   **This runs in lite mode exactly as it does in standard mode.** Lite mode trades QA depth for
+   speed; it has previously been the path where Step 7 side-effects were quietly skipped, which is
+   why this is stated rather than left implied. The CLI takes no mode flag, and a test pins its whole
+   argument surface so one cannot be added without that decision being made deliberately.
+
+   **Bug mode (`registry-tick`):** run — call it exactly as above, unconditionally. It reads the
+   document's own kind and answers `not-a-task` without touching any registry; the bug registry (or
+   the parent story/task's Bug Reports table) is written by develop-bug Part B3, not here.
+
+4. **Add DoD Verification Section to Document Body:**
+   - Add a "## Definition of Done - PASSED ✅" section to the document
+   - **Place it immediately before the change-log block**: before a `## Change Log` heading that sits
+     directly above `<!-- change-log-start -->`, else before the marker itself — never between the
+     markers, where every later append carries it as prose inside the log (obs #229)
+   - Summarize all verified criteria
+   - **If QA reports exist**, include QA findings and reference the QA report
+   - Include review date and reviewer
+
+   **Example (with QA report):**
+
+   ```markdown
+   ## Definition of Done - PASSED ✅
+
+   **Status:** ACCEPTED
+
+   ### QA Report Summary
+
+   **QA Report**: `story.309.2.2C.qa.1.initial-review.md`
+   **Gate File**: `story.309.2.2C.gate.1.initial-review.yml`
+   **Gate Status**: ✅ PASS
+   **Quality Score**: 90/100 (EXCELLENT)
+
+   All Definition of Done criteria have been verified:
+
+   ✅ **Acceptance Criteria:** All 5 criteria met (AC1-2 complete, AC3-5 ready with tests created)
+   ✅ **Unit Tests:** 14 unit tests + 27 test groups (integration/load/performance) - 2,245 lines of test code
+   ✅ **PR Review:** PR #43 with 8 commits, 21 files changed (+4,738/-227 lines)
+   ✅ **Documentation:** 1,400+ lines of deployment guides, DI patterns, troubleshooting
+   ✅ **Security Review:** ✅ PASS - No hardcoded credentials, proper validation, graceful degradation
+   ✅ **Performance:** ✅ PASS - Concurrent health checks, Redis caching, performance targets documented
+   ✅ **Reliability:** ✅ PASS - Comprehensive error handling, automatic failover
+   ✅ **Maintainability:** ✅ PASS - Excellent test coverage (2.8:1 ratio), extensive documentation
+
+   **Deployment Readiness:**
+
+   - Staging: ✅ APPROVED (ready for deployment)
+   - Production: ⚠️ CONDITIONAL (pending staging validation)
+
+   **Story marked as ACCEPTED on:** 2025-02-01
+   ```
+
+   **Example (without QA report):**
+
+   ```markdown
+   ## Definition of Done - PASSED ✅
+
+   **Status:** ACCEPTED
+
+   All Definition of Done criteria have been verified:
+
+   ✅ **Acceptance Criteria:** All 5 criteria met
+   ✅ **Unit Tests:** PR #789 approved by 2 reviewers, tests in `src/auth/auth.spec.ts`
+   ✅ **Documentation:** API docs updated in `docs/api/auth.md`, Swagger spec updated
+   ✅ **Security Review:** Password hashing, JWT security, input validation verified
+   ✅ **Compliance Review:** GDPR consent flow implemented, WCAG AA accessibility met
+
+   **Story marked as ACCEPTED on:** 2025-02-01
+   ```
+
+5. **Reference Running Summary in DoD Section:**
+   - Add a reference to the detailed running summary file
+   - Example: "**Detailed Verification Log:** See `story.311.1.dod.1.example-system.md` for complete verification evidence and timestamps."
+
+   **Bug mode (`body-dod-section`):** skip — items 4 and 5 both. A bug report has no
+   `## Definition of Done` section; its closing record is `## Resolution Summary`, which develop-bug
+   Part B1 writes, and the DoD file is referenced from there. Writing a DoD block into a bug report
+   would put a second verdict in a document whose lifecycle table already carries one.
+
+6. **Generate Sprint Review Summary:**
+   - Use the template from `assets/sprint-review-summary-template.md`
+   - Fill in all sections with information from the story/task document and PR
+   - Save summary as: `{story-directory}/sprint-review-summary.md`
+
+   **Bug mode (`sprint-review`):** skip — a bug fix is reported through its Resolution Summary and
+   the registry row, not a sprint-review artefact; bug.13 and bug.14 both recorded "not generated"
+   here by hand. Nothing below (6a, 6b) may reference `sprint-review-summary.md` on a bug run.
+
+---
+
+**The publish boundary (task.115).** Actions 1–6 above are *local writes*. Actions 7–8 below are
+*outward side-effects* — a PR comment, a tracker comment, an issue close, a board move — each of
+which tells a reader that the work is accepted and points them at artefacts. Between the two sits
+one rule: **everything that leaves the repo happens after the last write, and after that write has
+been pushed and verified.** Three observations record what happens without it — a DoD posted
+under a `PENDING` head (#40), a PASS gate certifying a working tree whose commit had been rejected
+(#48), a status header contradicting its own verdict (#57). The three sub-steps below are the
+boundary. They are not optional in lite mode and they are not skipped when this skill runs
+standalone.
+
+6a. **Acceptance commit + push.** Stage exactly the artefacts actions 1–6 wrote and commit them.
+   Until task.115 this commit did not exist here — the artefacts rode to the remote in the
+   orchestrator's Step 8, *after* every side-effect below had already fired, so the commit carrying
+   `status: accepted` was structurally never the one CI had verified.
+
+   ```bash
+   BRANCH=$(git rev-parse --abbrev-ref HEAD)
+   STEM="{story.{epic}.{story} | task.{id} | bug mode: the bug prefix, e.g. task.67.bug.3}"   # the work item's filename stem
+   DOC_KIND="{story | task | bug — the kind the Document-kind block resolved}"   # re-bound here: no block inherits another's variables (TASK-121-BUG-2)
+   # Empty OR left as a placeholder: `{story.{epic}…}` is non-empty and passed the first
+   # version of this guard, after which the DoD glob matched nothing at exit 0 (cycle-6 CR-3).
+   case "$STEM$DOC_KIND" in *'{'*) echo "HALT: STEM and DOC_KIND must be bound in this block — both are substituted inputs, not values carried over from an earlier block (empty or an unsubstituted placeholder found)"; exit 1 ;; esac
+   [ -n "$STEM" ] && [ -n "$DOC_KIND" ] || { echo "HALT: STEM and DOC_KIND must be bound in this block — one of them is empty"; exit 1; }
+
+   # Exactly the acceptance artefacts, CHOSEN IN THE BLOCK by kind: a bug run stages the bug
+   # report (its Status History row from 7.3) and the DoD file — there is no sprint review to
+   # stage, and naming it would abort the add. The bug list used to live only in the marker
+   # prose beside this block, so the block HALTed verbatim on every bug run (TASK-125-BUG-16).
+   # The implementation report is NOT staged here — the orchestrator's Step 8 owns its final
+   # commit, and staging it would split its history.
+   # The commit below carries the FULL INDEX, not only these paths: in a develop pipeline, 5c
+   # stages the PR review report and any doc-only CONCERNS fixes and commits nothing, so they ride
+   # this commit (task.173; develop-pipeline-step-5-6-qa-loop.md § "Carry the review into the
+   # acceptance commit"). The message says so when it happens — CARRY_SUFFIX below.
+   # The DoD path is resolved FIRST, zsh-safe and by number, and checked — a bare glob inside
+   # the array assignment aborted the whole script under zsh before the HALT below could
+   # print (cycle-8 CR-5; ordering: TASK-125-BUG-21).
+   [ -d "{document-directory}" ] || { echo "HALT: {document-directory} is not a directory — substitute the document directory before running this block"; exit 1; }
+   source .agents/skills/finalise/references/newest-numbered.sh || exit 1   # one definition (task.138)
+   DOD_PATH=$(newest_numbered "{document-directory}" dod -name "${STEM}.dod.*.md")
+   [ -n "$DOD_PATH" ] || { echo "HALT: no ${STEM}.dod.*.md beside the document — 7.2 writes it before this block runs"; exit 1; }
+   if [ "$DOC_KIND" = "bug" ]; then
+     ADD_PATHS=("{document-path}" "$DOD_PATH")
+     COMMIT_MSG="docs(${STEM}): DoD verified — finalise --bug"
+   else
+     ADD_PATHS=("{document-path}" "$DOD_PATH" "{document-directory}/sprint-review-summary.md")
+     COMMIT_MSG="docs(${STEM}): accept — DoD, sprint review"
+   fi
+   # --- acceptance artefacts resolved (the executed test slices to here) ---
+   # One unmatched pathspec aborts the WHOLE `git add`, so the registry (tasks only; absent on a
+   # story or a project without one) is added on its own, behind an existence check — not folded
+   # into the list behind a `|| true` that would also swallow a real failure.
+   # Read the add's exit code. A failed add — bash: "pathspec did not match" (128) — leaves the
+   # index clean, and the idempotency guard below would then read that as "already committed"
+   # and push nothing (task.115 5c pass 2, CR-1). The DoD path above is already resolved and
+   # checked, so no bare glob reaches this add (cycle-8 CR-5).
+   git add "${ADD_PATHS[@]}"
+   ADD_EXIT=$?
+   [ "$ADD_EXIT" -eq 0 ] || { echo "HALT: git add of the acceptance artefacts failed (exit $ADD_EXIT) — an artefact is missing or the DoD glob matched nothing"; exit 1; }
+   if [ -f docs/tasks/task-registry.md ]; then
+     git add docs/tasks/task-registry.md
+     ADD_EXIT=$?
+     [ "$ADD_EXIT" -eq 0 ] || { echo "HALT: git add of the task registry failed (exit $ADD_EXIT)"; exit 1; }
+   fi
+
+   # NEVER suppress a commit's output or exit status in a chain. The rejection this rule exists
+   # for (obs #48) was a pre-commit hook refusing the commit — and `>/dev/null 2>&1 || true`
+   # turned that refusal into a PASS gate over an unpushed working tree. Read the exit code.
+   # The suffix is keyed on the registry being STAGED, not on the file existing — a story run in
+   # a repo that keeps a task registry would otherwise claim a tick it did not make.
+   REG_SUFFIX=$(git diff --cached --quiet -- docs/tasks/task-registry.md 2>/dev/null || echo '; registry ticked')
+   # Anything staged beyond the acceptance artefacts and the registry is 5c's carried set (or, in a
+   # standalone run, whatever the operator staged by hand — the suffix then says so truthfully).
+   # git spells the artefacts' names on both sides: a pathspec diff over ADD_PATHS normalises an
+   # absolute, `./`-prefixed or doubled-slash path to the name the full list prints, where a string
+   # comparison read every artefact as carried (task.173 QA-1, CR-4).
+   EXPECTED=$(git -c core.quotePath=false diff --cached --name-only -- "${ADD_PATHS[@]}" docs/tasks/task-registry.md)
+   CARRIED=$(git -c core.quotePath=false diff --cached --name-only \
+     | grep -vxF -f <(printf '%s\n' "$EXPECTED") || true)
+   CARRY_SUFFIX=""
+   [ -n "$CARRIED" ] && CARRY_SUFFIX='; 5c review carried'
+   # Idempotent on re-run: when the artefacts are already committed there is nothing staged, and
+   # `git commit` would exit 1 for "nothing to commit" — indistinguishable from a hook rejection.
+   # Skip the COMMIT in that case (never the push, and never `--allow-empty`).
+   if git diff --cached --quiet; then
+     echo "acceptance artefacts already committed — skipping commit, pushing"
+   else
+     git commit -m "${COMMIT_MSG}${REG_SUFFIX}${CARRY_SUFFIX}"
+     COMMIT_EXIT=$?
+     [ "$COMMIT_EXIT" -eq 0 ] || { echo "HALT: acceptance commit rejected (exit $COMMIT_EXIT) — see output above"; exit 1; }
+   fi
+
+   git push origin "$BRANCH"
+   PUSH_EXIT=$?
+   [ "$PUSH_EXIT" -eq 0 ] || { echo "HALT: acceptance push rejected (exit $PUSH_EXIT)"; exit 1; }
+   CI_HEAD_2=$(git rev-parse HEAD)
+   ```
+
+   **Bug mode (`acceptance-commit`):** run — the block itself branches on `DOC_KIND` (bound in
+   the block): `STEM` is the bug prefix (`bug.13`, `story.7.4.bug.4`, `task.67.bug.3`), the
+   `git add` names **the bug report** (it carries the Status History row from 7.3) and **the DoD
+   file** only — no `sprint-review-summary.md` — and the commit message is
+   `docs(${STEM}): DoD verified — finalise --bug`. The registry check is a no-op because the tick
+   answered `not-a-task`. Nothing here is an instruction to edit the block: it ran verbatim in
+   task mode only until TASK-125-BUG-16 moved the bug list from this note into the block.
+
+   The `git diff --cached --quiet` guard is in the block, not beside it: the first version said
+   "skip the commit when clean" in prose two lines below an unconditional `git commit`, and the prose
+   lost (task.115 5c, CR-2). Never reach for `--allow-empty`.
+
+6b. **Tracked-and-pushed assertions.** A gate describes a working tree; a PR describes a branch.
+   Before anything below reads or posts an artefact, assert the artefact is *on the remote*, not
+   merely on disk:
+
+   ```bash
+   BRANCH=$(git rev-parse --abbrev-ref HEAD)
+   STEM="{story.{epic}.{story} | task.{id} | bug mode: the bug prefix, e.g. task.67.bug.3}"
+   DOC_KIND="{story | task | bug — the kind the Document-kind block resolved}"
+   case "$STEM$DOC_KIND" in *'{'*) echo "HALT: STEM and DOC_KIND must be bound in this block — substituted inputs, not values carried over from 6a (empty or an unsubstituted placeholder found)"; exit 1 ;; esac
+   [ -n "$STEM" ] && [ -n "$DOC_KIND" ] || { echo "HALT: STEM and DOC_KIND must be bound in this block — one of them is empty"; exit 1; }
+   [ -d "{document-directory}" ] || { echo "HALT: {document-directory} is not a directory — substitute the document directory before running this block"; exit 1; }
+   source .agents/skills/finalise/references/newest-numbered.sh || exit 1   # one definition (task.138)
+   DOD_PATH=$(newest_numbered "{document-directory}" dod -name "${STEM}.dod.*.md")
+   [ -n "$DOD_PATH" ] || { echo "HALT: no ${STEM}.dod.*.md beside the document — 7.2 writes it before this block runs (cycle-6 CR-3)"; exit 1; }
+   # The artefact list and the final assertion are chosen IN THE BLOCK by kind: a bug run has
+   # no sprint review, and its frontmatter was deliberately not changed in 7.2, so asserting
+   # `status: accepted` on it HALTed every correct bug run while the bug variant lived only in
+   # the note below (TASK-125-BUG-16).
+   if [ "$DOC_KIND" = "bug" ]; then
+     ARTIFACTS=("{document-path}" "$DOD_PATH")
+     # A state only Step 7.1 writes. The heading is NOT that state: the template ships it at
+     # Step 0, so a stub and a filled DoD reached the same PASS (task.125 5c CR-1, obs #146).
+     FINAL_ASSERT_PATH="$DOD_PATH"; FINAL_ASSERT_PATTERN='^\*\*Final Status:\*\* ✅ ACCEPTED'
+     FINAL_ASSERT_DESC="the pushed DoD file does not carry **Final Status:** ✅ ACCEPTED — Step 7.1 did not fill it"
+   else
+     ARTIFACTS=("{document-path}" "$DOD_PATH" "{document-directory}/sprint-review-summary.md")
+     FINAL_ASSERT_PATH="{document-path}"; FINAL_ASSERT_PATTERN='^status: accepted$'
+     FINAL_ASSERT_DESC="the pushed document does not read status: accepted"
+   fi
+   # --- assertions resolved (the executed test slices to here) ---
+   for ARTIFACT in "${ARTIFACTS[@]}"; do
+     git ls-files --error-unmatch "$ARTIFACT" >/dev/null \
+       || { echo "HALT: $ARTIFACT is not tracked — the acceptance commit did not include it"; exit 1; }
+     git show "origin/${BRANCH}:${ARTIFACT}" 2>/dev/null | grep -q . \
+       || { echo "HALT: $ARTIFACT is not on origin/${BRANCH} — the push did not carry it"; exit 1; }
+   done
+   git show "origin/${BRANCH}:${FINAL_ASSERT_PATH}" | grep -q "$FINAL_ASSERT_PATTERN" \
+     || { echo "HALT: $FINAL_ASSERT_DESC"; exit 1; }
+   ```
+
+   `-f` and `ls` answer "does a file exist here"; `git ls-files --error-unmatch` answers "is it
+   tracked" and `git show origin/<branch>:<path>` answers "is it on the branch the PR describes".
+
+   **Bug mode (`pushed-assertions`):** run — the block itself branches on `DOC_KIND`: the loop
+   covers the bug report and `$DOD_PATH` only (no sprint review), and the final assertion is
+   `**Final Status:** ✅ ACCEPTED` on `$DOD_PATH` — a state only 7.1 writes; the heading the template
+   ships at Step 0 proved nothing (5c CR-1) — rather than `status: accepted` on the document —
+   the bug's frontmatter was deliberately not changed in 7.2, so asserting `accepted` on it
+   would HALT every correct bug run. Not an instruction to edit the block (TASK-125-BUG-16).
+   Only the last question is the one a reviewer's PR view will agree with. (These are per-artifact
+   on purpose: `references/verify-push-state.sh`, which the orchestrator's Step 8 runs, fails on
+   *any* dirty tree — and here the orchestrator's implementation report is legitimately uncommitted
+   until Step 8, so that script would refuse a correct state.)
+
+6c. **Second CI reading — on the head that carries the acceptance.** Re-run the Step 6 rollup query
+   (the GitHub `gh pr view … statusCheckRollup` form or the Bitbucket pipelines form — same code,
+   same `PENDING`/`NONE`/`CANCELLED`/`UNKNOWN` semantics) against the PR, whose head is now
+   `CI_HEAD_2`, and **resolve it before any side-effect below fires**:
+
+   **Bug mode (`ci-reading-2`):** run — unchanged. The acceptance head is the commit 6a pushed,
+   whatever it staged.
+
+   ```bash
+   # Confirm the PR head IS the commit just pushed — never gate one commit and read another.
+   PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid -q '.headRefOid' 2>/dev/null)   # Bitbucket: .source.commit.hash
+   [ "${PR_HEAD:0:12}" = "${CI_HEAD_2:0:12}" ] \
+     || { echo "HALT: PR head ${PR_HEAD:0:12} ≠ pushed acceptance head ${CI_HEAD_2:0:12}"; exit 1; }
+
+   # Bounded poll, run in the BACKGROUND and read from a result file on a later turn. A push
+   # supersedes the previous run, so the first samples are legitimately NONE / CANCELLED /
+   # PENDING; `MAX_WAIT` bounds the wait, it does not round it up. The loop is never run in the
+   # foreground of a tool call: on a 23-minute serial lane a foreground wait simply outlives the
+   # host's timeout and reports nothing — the `gh pr checks --watch` failure, observed three times
+   # on one PR (task.115 QA cycle 1, CR-2).
+   mkdir -p .claude/state          # gitignored; absent in a fresh worktree or a standalone run
+   # The poll is a background TASK the orchestrator waits on across turns: mark the wait on the
+   # pipeline lock so the Stop hook allows the yielded turns (task.124, obs #89), and clear it on
+   # the later turn that reads $RESULT. Both are silent no-ops without a lock (standalone run).
+   # The budget is the POLL'S OWN bound, not the subagent default: a 10-minute mark on a 25-minute
+   # poll re-prompted the last 15 minutes of every legitimate wait (task.124 QA cycle 1, CR-2).
+   bash .agents/skills/finalise/references/set-waiting-on.sh "step-7 CI poll (reading 2)" --kind task \
+     --budget-minutes "$(( ${FINALISE_CI_MAX_WAIT:-1500} / 60 + 1 ))"
+   POLL=.claude/state/finalise-ci-poll.sh
+   RESULT=.claude/state/finalise-ci-result.txt
+   PIDFILE=.claude/state/finalise-ci-poll.pid
+   rm -f "$RESULT" "$PIDFILE"
+   # Terminator and body at COLUMN 0 — an indented terminator does not close the heredoc and
+   # bash swallows the nohup line below into the script, so the poll never starts.
+   cat > "$POLL" <<'POLLEOF'
+#!/usr/bin/env bash
+# usage: finalise-ci-poll.sh <PR_NUMBER> <EXPECTED_HEAD> <MAX_WAIT_SECONDS> <RESULT_FILE> [EXPECTED_CHECKS] [ENGINE]
+# Writes ONE line to RESULT_FILE when it concludes: "<STATE> <HEAD> <CHECKS> <WAITED>s TREE_EQ=<sha12 or empty>".
+# <STATE> is the rollup token, or UNDECIDED when MAX_WAIT ran out on a SUCCESS that never qualified.
+# ENGINE is the path of ci-tree-equivalence.js; absent means the docs-only rule is off for this poll.
+PR_NUMBER=${1}; EXPECTED_HEAD=${2}; MAX_WAIT=${3}; RESULT=${4}; EXPECTED_CHECKS=${5:-0}; ENGINE=${6:-}
+TREE_EQ=""; TE_LATCHED=0
+# The docs-only arm parses the engine's JSON with jq. Without jq nothing could ever be latched and a
+# configured checkCommand would be re-run every 30 s for the whole wait, so the rule is OFF here and the
+# poll waits as before (QA cycle 3, review CR-10).
+command -v jq >/dev/null 2>&1 || { [ -z "$ENGINE" ] || echo "ci-tree-equivalence off: jq not found" >&2; ENGINE=""; }
+rollup() { : ...the Step 6 rollup query for this platform, verbatim — copy it, do not re-derive it...; }
+# The head CI was actually sampled on — read from the PR, never echoed back from the argument.
+# GitHub form shown; Bitbucket: the PR's .source.commit.hash. "unknown" on failure makes the
+# later-turn head check HALT rather than pass.
+sampled_head() { gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null || echo unknown; }
+# How many checks the rollup is green OVER. A push registers its fast lanes first; a rollup
+# sampled in that window is SUCCESS across three checks while the slow lanes have not yet
+# appeared (obs #87). Distinct checks, the same query as CI_CHECKS_1 (obs #3).
+# Bitbucket: the pipeline count for the head commit.
+checks() { gh pr view "$PR_NUMBER" --json statusCheckRollup -q '[.statusCheckRollup[] | (.name // .context // "")] | unique | length' 2>/dev/null || echo 0; }
+WAITED=0; PREV_CHECKS=-1
+STATE=$(rollup); CHECKS=$(checks)
+# A terminal state is accepted only when ALL of:
+#   (1) WAITED > 0 — the pre-loop sample can still be the PREVIOUS head's rollup, which a
+#       fresh push has not yet replaced (obs #108: a stale SUCCESS accepted at 0s);
+#   (2) the sampled head is the expected head — never gate one commit and read another;
+#   (3) the check count is at least reading 1's count and unchanged since the previous sample —
+#       a rollup that is still growing is not decided, whatever its state says.
+# FAILURE is terminal under (1) and (2) only: a red on a partial rollup is still a red.
+# A PENDING/NONE head may also conclude as SUCCESS when the docs-only rule (task.172) holds —
+# still under (1) and (2), so it is never taken on a stale or foreign head. The engine exits 0 for
+# tree-equivalent and for nothing else. Once it has answered code-changed, check-failed or disabled
+# the answer cannot change (the head is pinned), so it is latched and not re-run every 30 s — a
+# configured checkCommand is a full local suite. code-changed is only ever reported when no nearer
+# ancestor was left undecided, so it IS final; behind an undecided ancestor the engine says
+# no-green-ancestor instead (a CANCELLED ancestor counts as undecided and is re-asked too: that
+# costs polling, never a wrong answer). no-green-ancestor / unverifiable can change (an ancestor's
+# run may finish), so those are asked again.
+tree_equivalent() {
+  [ -n "$ENGINE" ] && [ "$TE_LATCHED" -eq 0 ] || return 1
+  local out sha
+  if out=$(command node "$ENGINE" --head-rollup "$STATE" --head "$EXPECTED_HEAD" --pr "$PR_NUMBER" --json 2>/dev/null); then
+    sha=$(printf '%s' "$out" | jq -r '.greenSha[0:12] // empty')
+    [ -n "$sha" ] || return 1
+    TREE_EQ=$sha; return 0
+  fi
+  case "$(printf '%s' "$out" | jq -r '.reason // empty' 2>/dev/null)" in
+    code-changed|check-failed|disabled) TE_LATCHED=1 ;;
+  esac
+  return 1
+}
+decided() {
+  [ "$WAITED" -gt 0 ] || return 1
+  [ "$(sampled_head | cut -c1-12)" = "$(printf '%s' "$EXPECTED_HEAD" | cut -c1-12)" ] || return 1
+  case "$STATE" in
+    FAILURE) return 0 ;;
+    SUCCESS) [ "$CHECKS" -ge "$EXPECTED_CHECKS" ] && [ "$CHECKS" -eq "$PREV_CHECKS" ] ;;
+    PENDING|NONE) if tree_equivalent; then STATE=SUCCESS; return 0; fi; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+DECIDED=0
+while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+  decided && { DECIDED=1; break; }
+  sleep 30; WAITED=$((WAITED + 30)); PREV_CHECKS=$CHECKS; STATE=$(rollup); CHECKS=$(checks)
+done
+# MAX_WAIT ran out. The last sample was taken after the loop's last decided(), so judge it once.
+# Only a SUCCESS is re-judged: decided() on a PENDING/NONE head asks the engine, and FAILURE is
+# terminal for the reader anyway. A SUCCESS that still fails the floor or the stable-count rule is
+# NOT a green reading: printed as sampled, the reader accepted a rollup that stayed partial for the
+# whole wait, which is the case the floor exists to refuse (obs #4). UNDECIDED makes the reader HALT.
+if [ "$DECIDED" -eq 0 ] && [ "$STATE" = SUCCESS ]; then
+  decided || STATE=UNDECIDED
+fi
+printf '%s %s %s %ss TREE_EQ=%s\n' "$STATE" "$(sampled_head)" "$CHECKS" "$WAITED" "$TREE_EQ" > "$RESULT"
+POLLEOF
+   # CI_CHECKS_1 is the check count reading 1 was green over (Step 6 records it beside CI_ROLLUP).
+   nohup bash "$POLL" "$PR_NUMBER" "$CI_HEAD_2" "${FINALISE_CI_MAX_WAIT:-1500}" "$RESULT" "${CI_CHECKS_1:-0}" \
+     .agents/skills/finalise/references/ci-tree-equivalence.js \
+     > .claude/state/finalise-ci-poll.log 2>&1 &
+   echo $! > "$PIDFILE"
+   echo "CI poll backgrounded (pid $(cat "$PIDFILE")) — read $RESULT on a later turn; absent means still polling"
+   ```
+
+   **On a later turn**, read the result — never `sleep` for it in the foreground:
+
+   ```bash
+   RESULT=.claude/state/finalise-ci-result.txt
+   PIDFILE=.claude/state/finalise-ci-poll.pid
+   # A later turn is a fresh shell: CI_HEAD_2 from 6a is gone. HEAD has not moved since the
+   # acceptance push (nothing between 6a and here commits), so re-derive it rather than compare
+   # against an empty string.
+   CI_HEAD_2=${CI_HEAD_2:-$(git rev-parse HEAD)}
+   if [ ! -f "$RESULT" ]; then
+     # No result yet. "Still polling" is only true while the poll is alive — a dead poll with no
+     # result (killed, never started, log will say) must HALT, not report progress forever.
+     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+       echo "still polling — check again on a later turn"      # do NOT sleep here
+     else
+       echo "HALT: the CI poll is not running and wrote no result — see .claude/state/finalise-ci-poll.log"; exit 1
+     fi
+   else
+     # Five names, not four: with four, `read` binds the rest of the line to the last name and
+     # WAITED becomes "60s TREE_EQ=…" (measured, task.172).
+     read -r CI_ROLLUP_2 CI_HEAD_READ CI_CHECKS_2 WAITED CI_TREE_EQ_FIELD < "$RESULT"
+     CI_TREE_EQ_2=${CI_TREE_EQ_FIELD#TREE_EQ=}
+     # The wait is over — clear the mark before anything below can HALT (task.124).
+     bash .agents/skills/finalise/references/set-waiting-on.sh --clear
+     # CI_HEAD_READ is the head the poll SAMPLED from the PR, so this catches a push that landed
+     # mid-poll ("unknown" when the poll could not read it — a HALT, not a pass).
+     [ "${CI_HEAD_READ:0:12}" = "${CI_HEAD_2:0:12}" ] \
+       || { echo "HALT: CI was sampled on ${CI_HEAD_READ:0:12}, not the acceptance head ${CI_HEAD_2:0:12}"; exit 1; }
+     # Record what the reading was green OVER — a SUCCESS across 3 checks on a repo whose previous
+     # head decided 9 is a partial rollup, and the poll's stop condition refuses it; say so here
+     # too, so a reader of the log can see the count without re-deriving it.
+     echo "CI reading 2: $CI_ROLLUP_2${CI_TREE_EQ_2:+ (tree-equivalent to $CI_TREE_EQ_2)} @ ${CI_HEAD_2:0:12} over $CI_CHECKS_2 checks after $WAITED"
+   fi
+   ```
+
+   | `CI_ROLLUP_2`                              | Action                                                                                                                                                                  |
+   | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `SUCCESS`                                  | Proceed to action 7. Record `CI reading 2: SUCCESS @ {CI_HEAD_2}` — or, when `CI_TREE_EQ_2` is set, `CI reading 2: SUCCESS (tree-equivalent to {CI_TREE_EQ_2}) @ {CI_HEAD_2}`, never plain `SUCCESS`: the acceptance commit's own CI did not finish and the docs-only rule satisfied the reading |
+   | `FAILURE`                                  | **HALT `ci-not-green-on-acceptance-head`.** The acceptance commit is pushed and `status: accepted` is on the branch — do **not** revert it; report the failing job(s) and stop before any side-effect. The human decides whether the red is the docs commit or the code |
+   | `PENDING` / `NONE` / `CANCELLED` / `UNKNOWN` past `MAX_WAIT` | **HALT `ci-not-green-on-acceptance-head`** with the last sampled state. Waiting past the bound is a judgement for a human; assuming green is not a judgement at all |
+   | `UNDECIDED`                                | **HALT `ci-not-green-on-acceptance-head`.** `MAX_WAIT` ran out on a rollup that read `SUCCESS` without meeting the check floor (`CI_CHECKS_2` below reading 1's count) or without its count settling. Report both counts: a partial rollup is not a green reading, however long it was waited on (obs #4) |
+
+   > **The poll is a background job by construction, not by advice.** `gh pr checks --watch` is
+   > forbidden for the same reason (see `develop-next` Step 3): a wait that lives inside one tool
+   > call cannot outlast that call. The first version of this block was a foreground `while … sleep`
+   > loop with a note beneath it saying not to do that — the note was right and the block ignored it.
+   >
+   > **Why not one reading, after the push?** Because reading 1 gates the *decision* — `accepted`
+   > must never be written on a red or pending head — and reading 2 gates the *publication*. The
+   > final commit of any branch can be verified only after it exists, and recording that
+   > verification inside the commit would need a third commit; so reading 2 is recorded **off** the
+   > verified commit — on the PR canonical comment (action 7) and in the implementation report —
+   > and the DoD summary carries reading 1 with a pointer. The orchestrator's Step 8 commit
+   > (implementation report only, docs-only) is the residue this leaves unverified by a second
+   > reading. It is covered by the same docs-only rule at the merge step: `develop-next` Step 3
+   > re-verifies the final head (head-SHA equality, CI rollup, local `npm run ci`) before any merge
+   > it performs, and a `PENDING` head there is satisfied only by `tree-equivalent`, which names the
+   > green commit it rests on.
+
+   Reading 2 cannot be written into the running summary without a further commit, so it is
+   recorded in the implementation report's Decisions Log (`CI reading 1: … @ …; CI reading 2: … @
+   …`) and in the PR comment body below — both outside the verified commit.
+
+6d. **CHANGELOG citation check (advisory — warns, does not halt).** Every accepted work item
+   should be cited in `CHANGELOG.md` under `## [Unreleased]` as `(task N)` / `(bug N)` — the
+   convention in `docs/contributing/releases.md`. Until task.115 this was the one release-checklist
+   item with no mechanism behind it, and it drifted on five consecutive merges (obs #59).
+
+   ```bash
+   # Tasks only in this version; `(bug N)` is the documented follow-on once bugs 13 and 15 are
+   # backfilled. `STEM` is the work item's filename stem from 6a.
+   # Parameter expansion, NOT `[[ =~ ]]` + BASH_REMATCH: zsh — the shell this pipeline runs in —
+   # leaves BASH_REMATCH unset (it populates $match), so N was empty there and the grep pattern
+   # degenerated to one that matches any [Unreleased] text. The warning could never fire under
+   # zsh, and nothing said so (task.115 QA cycle 1, CR-1). A capture-free `=~` is fine in both.
+   N=""
+   case "$STEM" in task.*) N="${STEM#task.}" ;; esac
+   if [ -n "$N" ] && [[ "$N" =~ ^[0-9]+$ ]]; then
+     awk '/^## \[Unreleased\]/{p=1;next} /^## \[/{p=0} p' CHANGELOG.md \
+       | grep -qiE "\btask[ .]${N}\b" \
+       || echo "⚠️  no-changelog-entry: CHANGELOG.md [Unreleased] does not cite (task ${N}) — add the entry before release; evals/shared/tests/changelog-entry-drift.test.mjs fails CI on this once the PR merges"
+   fi
+   ```
+
+   **Advisory now, blocking later — and the flip is a release decision, not a memory.** This warns
+   in the release this ships in; `docs/contributing/releases.md` carries the checklist line that
+   flips it to a HALT (`no-changelog-entry`) in the release *after* that. A gate at authoring pushes
+   an author toward a filler entry, and a filler entry is worse than a missing one because it looks
+   deliberate; the drift test is the loud backstop in the meantime.
+
+---
+
+7. **Add Canonical PR Comment (idempotent via marker):**
+
+   **Bug mode (`pr-comment`):** run — the 6b block below re-binds `STEM` and `DOC_KIND` as
+   substituted inputs (HALT when either is empty), keys `DOD_PATH` on `${STEM}` (the bug prefix)
+   and, in bug mode, derives `FINAL_GATE` **in the block** from the newest implementation report's
+   last `**Verdict**:` line (either filename shape; HALT when none) instead of globbing gates; the body's head description and closing line branch on the kind too. All of
+   it is in the block itself, not in this note — a directory-wide glob here published a
+   co-located bug's PARENT artefacts as the bug's (TASK-125-BUG-8), and a verdict "bound in Step 2"
+   by prose was never bound at all (TASK-125-BUG-12).
+
+
+   **PR-comment authorship contract**:
+
+   | Skill      | Owns                                                                                                      |
+   | ---------- | --------------------------------------------------------------------------------------------------------- |
+   | `qa-task`  | Per-cycle gate decision (best-effort, non-blocking)                                                       |
+   | `qa-fix`   | Per-cycle fix summary (best-effort, non-blocking)                                                         |
+   | `finalise` | Canonical summary — PR + final gate + QA cycle count + DoD path + accepted status (idempotent via marker) |
+
+   `finalise` is the designated author of the canonical PR summary. It edits in place on re-run.
+
+   **Step 6a — Resolve QA cycle count:** folded into 6b below. It used to be its own fenced
+   block, and 6b read its `$CYCLES` — a value no block can inherit from another (TASK-121-BUG-2),
+   so the QA Cycles line was silently omitted on every run that executed the blocks as
+   documented (TASK-125-BUG-22). One block now locates the report once and derives both the
+   cycle count and, in bug mode, the verdict from it.
+
+   **Step 6b — Build comment body:**
+
+   ```bash
+   MARKER="<!-- finalise-canonical-summary -->"
+   # Keyed on the work item's own STEM, never a directory-wide glob. A story or
+   # task bug lives in its PARENT's directory: `task.67.dod.1.*` sorts after
+   # `task.67.bug.3.dod.1.*` and the parent's gate is the only gate there, so
+   # `*.dod.*.md | sort | tail -1` published the parent's DoD path and gate
+   # verdict as the bug's (TASK-125-BUG-8).
+   # BOTH inputs are re-bound HERE as substituted placeholders — the same two lines 7.6a
+   # and 7.6b carry. Every fenced block runs as its own shell, so nothing an earlier block
+   # bound exists in this one (TASK-121-BUG-2): an unbound DOC_KIND silently took the
+   # story/task branch (TASK-125-BUG-12), and an unbound STEM globbed `dir/.dod.*.md`,
+   # matched nothing, and published a canonical comment with an empty DoD path and empty
+   # gate at exit 0 (TASK-125-BUG-15). Empty is a HALT; so is a placeholder left verbatim
+   # (cycle-6 CR-3).
+   STEM="{story.{epic}.{story} | task.{id} | bug mode: the bug prefix, e.g. task.67.bug.3}"
+   DOC_KIND="{story | task | bug — the kind the Document-kind block resolved}"
+   case "$STEM$DOC_KIND" in *'{'*) echo "HALT: STEM and DOC_KIND must be bound in this block — substituted inputs, not values carried over from an earlier block (an unsubstituted placeholder found)"; exit 1 ;; esac
+   [ -n "$STEM" ] && [ -n "$DOC_KIND" ] || { echo "HALT: STEM and DOC_KIND must be bound in this block — one of them is empty"; exit 1; }
+   # The two inputs must agree, in BOTH directions: a bug prefix with a non-bug kind is
+   # this block run with a stale kind (cycle-4 CR-2), and a bug kind with the PARENT's
+   # stem would publish the parent task's verdict as the bug's (cycle-5 CR-6).
+   case "$STEM" in
+     bug.[0-9]*|*.bug.[0-9]*) [ "$DOC_KIND" = "bug" ] || { echo "HALT: STEM ${STEM} is a bug prefix but DOC_KIND is ${DOC_KIND} — bind the kind the Document-kind block resolved"; exit 1; } ;;
+     *) [ "$DOC_KIND" != "bug" ] || { echo "HALT: DOC_KIND is bug but STEM ${STEM} is not a bug prefix — a bug's STEM is its own prefix (task.67.bug.3), never its parent's"; exit 1; } ;;
+   esac
+   # Every numbered artefact is found with QUOTED `find -name` patterns and ordered by its
+   # NUMBER (TASK-125-BUG-21, BUG-14). ONE definition — the bundled newest-numbered.sh —
+   # sourced in every block that needs it, from the repository root like qa-cycle.sh (a
+   # fenced block shares no shell function with the next; three inline copies drifted —
+   # obs #146, task.138).
+   source .agents/skills/finalise/references/newest-numbered.sh || exit 1
+   # The directory is checked on its own first — a missing or verbatim `{document-directory}`
+   # otherwise reached the DoD HALT below and pointed the reader at 7.2 (cycle-9 CR-4).
+   [ -d "{document-directory}" ] || { echo "HALT: {document-directory} is not a directory — substitute the document directory before running this block"; exit 1; }
+   DOD_PATH=$(newest_numbered "{document-directory}" dod -name "${STEM}.dod.*.md")
+   # An empty DoD path is a HALT, never a blank line in the canonical comment: 7.2 wrote the
+   # file, so nothing here can legitimately fail to find it (cycle-6 CR-3).
+   [ -n "$DOD_PATH" ] || { echo "HALT: no ${STEM}.dod.*.md beside the document — 7.2 writes it before this block runs"; exit 1; }
+   # The implementation report — an IMPLEMENTATION_REPORT env var the orchestrator passed wins;
+   # otherwise the newest beside the document. The full-stem shape exists only for BUG reports
+   # (TASK-125-BUG-13); in story/task mode `${STEM}.*.implementation.*` with STEM=task.67 matched
+   # the co-located `task.67.bug.3.implementation.2.*` and the parent published its bug's cycle
+   # count (TASK-125-BUG-19). The one-shape line below says so for the enumeration test.
+   if [ -z "${IMPLEMENTATION_REPORT:-}" ] || [ ! -f "${IMPLEMENTATION_REPORT:-}" ]; then
+     if [ "$DOC_KIND" = "bug" ]; then
+       IMPLEMENTATION_REPORT=$(newest_numbered "{document-directory}" implementation -name "${STEM}.implementation.*.md" -o -name "${STEM}.*.implementation.*.md")
+     else
+       IMPLEMENTATION_REPORT=$(newest_numbered "{document-directory}" implementation -name "${STEM}.implementation.*.md")   # short-shape-only: story/task reports never carry the full-stem shape, and the second pattern matched a co-located bug's report (TASK-125-BUG-19)
+     fi
+   fi
+   # The cycle count, from the same report, in the same block that publishes it. Both heading
+   # names: the story/task QA loop writes `### QA Cycle {N}`, the develop-bug verify loop writes
+   # `### Verify Cycle {N}` (TASK-125-BUG-17). `|| true`, not `|| echo 0`: `grep -c` PRINTS 0
+   # and exits 1 on no match, and `|| echo 0` made the value "0\n0". No report → 0 → the line
+   # is omitted from the body below.
+   if [ -n "$IMPLEMENTATION_REPORT" ] && [ -f "$IMPLEMENTATION_REPORT" ]; then
+     CYCLES=$(grep -cE '^### (QA|Verify) Cycle' "$IMPLEMENTATION_REPORT" 2>/dev/null || true)
+     CYCLES=${CYCLES:-0}
+   else
+     CYCLES=0
+   fi
+   # --- cycle count resolved (the executed test slices to here) ---
+   if [ "$DOC_KIND" = "bug" ]; then
+     # A bug has no gate file; its verdict is the develop-bug verify loop's —
+     # the last `**Verdict**:` line of the implementation report beside the bug
+     # (QA Iteration History). Derived IN THIS BLOCK, and an empty verdict is a
+     # HALT, not an N/A: "never bound" and "genuinely N/A" must not share one
+     # value (TASK-125-BUG-12).
+     #
+     # Ordered by the report NUMBER, never by path: with both shapes on disk a plain sort
+     # put an older `bug.14.{name}.implementation.1.*` after a newer
+     # `bug.14.implementation.2.*` whenever `{name}` sorts past `i` (TASK-125-BUG-14).
+     # $IMPLEMENTATION_REPORT was located above, once, for both the cycle count and this.
+     # The bare token, never the line's second word: real reports write
+     # `**Verdict**: **PASS**` as often as `**Verdict**: PASS`, and the second
+     # word of the first is `**PASS**` (cycle-4 CR-3). Neither token is a HALT.
+     # Two states, two diagnostics — and a THIRD that must not wear either's clothes: a report
+     # that exists and cannot be read. `grep` on it prints nothing, which the branch below
+     # reported as "no verdict line found" and sent the reader to write one (gate 11 future,
+     # obs #146). Read before grep; an empty path still takes the "no report" diagnostic below.
+     if [ -n "$IMPLEMENTATION_REPORT" ] && [ ! -r "$IMPLEMENTATION_REPORT" ]; then
+       echo "HALT: bug mode — ${IMPLEMENTATION_REPORT} exists but is not readable — a permission or a dangling path, not a missing verdict"; exit 1
+     fi
+     VERDICT_LINE=$(grep -E '^\*\*Verdict\*\*:' "${IMPLEMENTATION_REPORT:-/dev/null}" 2>/dev/null | tail -1)
+     # ONE refusal path (TASK-125-BUG-24). The verdict is the FIRST word after the colon with
+     # its bold stripped, and it must be exactly PASS or FAIL. The verify-loop template's own
+     # placeholder `{PASS / FAIL}` fails that rule by itself (its first character is a brace),
+     # and so does the placeholder with its braces dropped — `PASS / FAIL`, `PASS|FAIL` — because
+     # what FOLLOWS the first word begins with the template's alternation. A brace anywhere else
+     # on the line is prose: this repository's verdict lines routinely name a `{placeholder}`
+     # in their trailing text, and a whole-line brace check HALTed every one of them
+     # (TASK-125-BUG-23's first fix; cycle-10 CR-1).
+     VERDICT_REST=$(printf '%s\n' "$VERDICT_LINE" | sed -E 's/^\*\*Verdict\*\*:[[:space:]]*//')
+     VERIFY_VERDICT=$(printf '%s\n' "$VERDICT_REST" | sed -nE 's/^\**([A-Za-z]+).*$/\1/p')
+     VERDICT_AFTER=$(printf '%s\n' "$VERDICT_REST" | sed -E 's/^\**[A-Za-z]+\**[[:space:]]*//')
+     case "$VERIFY_VERDICT" in PASS|FAIL) ;; *) VERIFY_VERDICT='' ;; esac
+     # A remainder that begins with a separator OR with the other verdict token is a template
+     # remnant, not a verdict: `PASS / FAIL`, `PASS|FAIL`, and the reworded `PASS or FAIL` /
+     # `FAIL or PASS` / `PASS FAIL`, which read as PASS until task.138 (gate 11 future, obs #146).
+     # Prose after a real verdict never starts with the other token.
+     case "$VERDICT_AFTER" in /*|\|*|PASS*|FAIL*|[Oo][Rr]\ *|[Oo][Rr]) VERIFY_VERDICT='' ;; esac
+     # Two states, two diagnostics (cycle-10 CR-3): no verdict line at all, or a line that
+     # exists and was refused — the reader told to write one must learn that one exists.
+     if [ -z "$VERIFY_VERDICT" ]; then
+       if [ -z "$VERDICT_LINE" ]; then
+         echo "HALT: bug mode — no **Verdict**: PASS|FAIL line found in ${IMPLEMENTATION_REPORT:-<no ${STEM}.implementation.*.md or ${STEM}.*.implementation.*.md beside the bug>}; the verify loop's QA Iteration History is the bug's only verdict"; exit 1
+       else
+         echo "HALT: bug mode — the last **Verdict**: line in ${IMPLEMENTATION_REPORT} is not an exact PASS or FAIL: ${VERDICT_LINE}"; exit 1
+       fi
+     fi
+     FINAL_GATE="$VERIFY_VERDICT"
+     # What the acceptance commit carried, and what "accepted" means, differ by
+     # kind: bug mode writes no `status: accepted` (frontmatter-accepted: skip)
+     # and the bug closes in develop-bug Part B (cycle-3 CR-2).
+     HEAD_DESC="pushed DoD head — the commit carrying the DoD file and the Status History row"
+     CLOSING_LINE="All applicable Definition of Done criteria verified. Bug fix accepted — closed by develop-bug Step 7 Part B."
+   else
+     # The gate path is resolved FIRST and checked: the old `… | awk … || echo "N/A"` never
+     # emitted N/A (awk exits 0 on empty input), so a missing gate published an empty Final
+     # Gate — the "never bound" vs "genuinely N/A" ambiguity the bug branch HALTs on
+     # (cycle-5 CR-9 / cycle-7 CR-3). A story or task always has a gate by Step 7.
+     GATE_PATH=$(newest_numbered "{document-directory}" gate -name "${STEM}.gate.*.yml")
+     [ -n "$GATE_PATH" ] || { echo "HALT: no ${STEM}.gate.*.yml beside the document — the QA loop writes one before Step 7"; exit 1; }
+     FINAL_GATE=$(grep '^gate:' "$GATE_PATH" | head -1 | grep -oE 'PASS|CONCERNS|FAIL|WAIVED' | head -1)
+     [ -n "$FINAL_GATE" ] || { echo "HALT: $GATE_PATH carries no gate: PASS|CONCERNS|FAIL|WAIVED line"; exit 1; }
+     HEAD_DESC="pushed acceptance head — the commit carrying \`status: accepted\`"
+     CLOSING_LINE="All Definition of Done criteria verified. Story/task accepted."
+   fi
+
+   # The plain-language lead. It goes BELOW the marker and above everything
+   # else — see the warning under Step 6c. `done` is the same stage the tracker
+   # comment uses; one vocabulary, not a second one for pull requests.
+   LEAD=$(node references/stakeholder-summary-cli.js --stage done) || exit 1
+
+   # CI_TREE_EQ (reading 1, Step 6) and CI_TREE_EQ_2 (reading 2, 6c) are INPUTS to this block, bound
+   # by the agent from the readings it recorded, exactly like CI_ROLLUP and CI_ROLLUP_2 above: this
+   # block is its own shell and computes neither. Both are EMPTY when the reading waited for the
+   # head's own CI, and a non-empty one is why the record below says "tree-equivalent to <sha>"
+   # rather than plain SUCCESS (task.172 QA cycle 1, CR-3). A SUCCESS that the docs-only rule
+   # satisfied and that is written here without its sha is the record this rule exists to prevent,
+   # so an UNSET one aborts the block (`${VAR?}` fails on unset and accepts empty): bind it, empty
+   # when the reading waited, rather than let an unbound variable write plain SUCCESS (CR2-8).
+   # (No apostrophe inside the ${VAR?word} text: bash 3.2, the macOS default, mis-parses one.)
+   : "${CI_TREE_EQ?bind CI_TREE_EQ, empty when reading 1 waited for the head CI}" \
+     "${CI_TREE_EQ_2?bind CI_TREE_EQ_2, empty when reading 2 waited for the head CI}"
+
+   BODY="$MARKER
+   $LEAD
+
+   ---
+
+   ## ✅ Accepted — Canonical Pipeline Summary
+
+   **PR**: ${PR_URL}
+   **Final Gate**: ${FINAL_GATE}
+   **Accepted**: $(date +%Y-%m-%d)
+   **DoD Summary**: \`${DOD_PATH}\`
+   **CI reading 1**: ${CI_ROLLUP}${CI_TREE_EQ:+ (tree-equivalent to ${CI_TREE_EQ})} @ \`${CI_HEAD_1:0:12}\` (acceptance decision)
+   **CI reading 2**: ${CI_ROLLUP_2}${CI_TREE_EQ_2:+ (tree-equivalent to ${CI_TREE_EQ_2})} @ \`${CI_HEAD_2:0:12}\` (${HEAD_DESC})
+   $([ "$CYCLES" -gt 0 ] && echo "**QA Cycles**: ${CYCLES}" || true)
+
+   ${CLOSING_LINE}"
+   ```
+
+   > **The lead goes below the marker, and the ordering is load-bearing.** Step 6c finds this
+   > comment with `select(.body | startswith("<!-- finalise-canonical-summary -->"))` and then
+   > PATCHes it by id. A lead inserted *above* the marker makes that search miss, and the pipeline
+   > posts a **new** comment on every run instead of updating the existing one — which surfaces as
+   > duplicate comments, reads as a formatting problem, and never fails. `$BODY` is built once here
+   > and used by the POST path, the PATCH path and the Bitbucket arm alike, so the lead cannot reach
+   > one and miss another.
+
+   **Step 6c — Idempotent post (search-then-edit):**
+
+   _GitHub:_
+
+   ```bash
+   # Search for existing canonical comment by marker; extract numeric ID from URL
+   # (.databaseId is not available — gh pr view returns .url like ...#issuecomment-12345)
+   EXISTING_COMMENT_ID=$(gh pr view "$PR_URL" --json comments \
+     -q '.comments[] | select(.body | startswith("<!-- finalise-canonical-summary -->")) | .url' \
+     2>/dev/null | head -1 | grep -oE '[0-9]+$')
+
+   if [ -n "$EXISTING_COMMENT_ID" ]; then
+     # Edit existing comment by ID — do NOT use --edit-last (ordering unreliable)
+     OWNER=$(gh repo view --json owner -q '.owner.login')
+     REPO_NAME=$(gh repo view --json name -q '.name')
+     gh api -X PATCH "/repos/${OWNER}/${REPO_NAME}/issues/comments/${EXISTING_COMMENT_ID}" \
+       -f body="$BODY" >/dev/null \
+       && echo "✅ Canonical summary comment updated (ID: $EXISTING_COMMENT_ID)" \
+       || echo "⚠️ PR comment edit failed — attempting new comment"
+   else
+     gh pr comment "$PR_URL" --body "$BODY" \
+       && echo "✅ Canonical summary comment posted" \
+       || echo "⚠️ PR comment failed — non-blocking"
+   fi
+   ```
+
+   _Bitbucket:_
+
+   ```bash
+   # Bearer or Basic, chosen by variable name. Non-blocking like the rest of
+   # this step: without a credential the comment cannot be posted, and a 404
+   # from an unauthenticated call would otherwise look like a missing PR.
+   source references/bitbucket-auth.sh || echo "⚠️ No Bitbucket credential — PR comment skipped"
+
+   # Search for existing canonical comment by marker
+   EXISTING_COMMENT_ID=$(curl -sf \
+     "${BB_CURL_AUTH[@]}" \
+     "${BB_API}/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${PR_NUMBER}/comments" \
+     | jq -r '.values[] | select(.content.raw | startswith("<!-- finalise-canonical-summary -->")) | .id' \
+     | head -1)
+
+   BB_COMMENT_PAYLOAD=$(jq -n --arg raw "$BODY" '{content: {raw: $raw}}')
+   if [ -n "$EXISTING_COMMENT_ID" ]; then
+     curl -sf -X PUT \
+       "${BB_CURL_AUTH[@]}" \
+       -H "Content-Type: application/json" \
+       "${BB_API}/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${PR_NUMBER}/comments/${EXISTING_COMMENT_ID}" \
+       -d "$BB_COMMENT_PAYLOAD" >/dev/null \
+       && echo "✅ Canonical summary comment updated" \
+       || echo "⚠️ PR comment edit failed — attempting new comment"
+   else
+     curl -sf -X POST \
+       "${BB_CURL_AUTH[@]}" \
+       -H "Content-Type: application/json" \
+       "${BB_API}/repositories/${BB_WORKSPACE}/${BB_REPO}/pullrequests/${PR_NUMBER}/comments" \
+       -d "$BB_COMMENT_PAYLOAD" >/dev/null \
+       && echo "✅ Canonical summary comment posted" \
+       || echo "⚠️ PR comment failed — non-blocking"
+   fi
+   ```
+
+   **Failure handling**: All `⚠️` paths are non-blocking. The implementation report in git is the durable audit trail.
+
+8. **Move Tracker Issue to Done:**
+
+   **Bug mode (`tracker-done`):** run — the whole item, unchanged: the Document-link re-point, the
+   `done` comment, the close / Done transition, the board `done` stage. The bug's tracker issue is
+   the one `ensure-bug-github-issue` / `ensure-bug-jira-issue` linked (`github_issue` / `jira_key`
+   from `bug-doc.js`). This is the **one writer** for the bug's tracker close; develop-bug Step 7
+   Part B4 reads the issue state back and repeats a step only when this one reports it did not land.
+
+   **Detect tracker platform** — resolver already sourced above (`TRACKER` is set):
+   - When `TRACKER=jira` → **Jira path**
+   - When `TRACKER=github` → **GitHub path**
+
+   **Re-point the Document link to a durable branch (do this first, before closing/transitioning):**
+
+   The tracker issue embeds a link to the source document on a git branch. During development that link points at the **feature branch**, which is **deleted after merge** — so a closed issue would link to a dead branch. At acceptance the work is about to merge into the long-lived integration branch, so re-point the link there now. (The doc lands on that branch only when the PR merges; if the PR is abandoned, re-sync later.)
+
+   Resolve the durable branch once (git-only, works for both platforms) — prefer `develop` when it exists on the remote, else the repo's default branch:
+
+   ```bash
+   DOC_PATH="{path to the story/task document being finalised}"
+   if git ls-remote --exit-code --heads origin develop >/dev/null 2>&1; then
+     DURABLE_BRANCH=develop
+   else
+     DURABLE_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+     DURABLE_BRANCH="${DURABLE_BRANCH:-main}"
+   fi
+   # Repo-relative path of the document (robust whether DOC_PATH is absolute or relative):
+   DOC_REL=$(git ls-files --full-name -- "$DOC_PATH")
+   ```
+
+   **Jira path** (when `TRACKER=jira`):
+
+   Extract `jira_key` from story/task frontmatter. If absent or null, skip this step silently.
+
+   Use the Atlassian MCP tools. Derive `cloudId` from `JIRA_URL` by extracting the hostname (e.g. `yourorg.atlassian.net`). If a tool call fails with a cloud resolution error, call `getAccessibleAtlassianResources` and use the `id` from the matching entry.
+
+   > **Order matters — the transition runs first, the re-link second.** Historically both
+   > `jira-stage.js` (via the transition protocol) and the `sync-jira-*` re-link below could drive the
+   > status, resolving it from **different config sources**: the transition uses the
+   > `tracker-workflow.yaml` ladder, the sync its own `loadStatusMap`. The re-link now runs with
+   > `--no-transition` (step 3), so it carries no status decision at all and the ladder is the single
+   > resolver by construction rather than by sequencing.
+   >
+   > **Keep the order anyway — but as convention, not as a safeguard.** Nothing about ladder-first
+   > *protects* anything once step 3 is status-neutral, and it is worth being exact about why, because
+   > two plausible-sounding justifications are both wrong:
+   >
+   > - *"It protects a consumer on a pre-flag `sync-jira-*`."* No: that sync rejects
+   >   `--no-transition` with `Unknown option` and exits before resolving anything, so its re-link
+   >   never runs, in either order.
+   > - *"It protects a consumer on an older **finalise** whose step 3 omits the flag."* Also no — and
+   >   this one is backwards. In that pairing the sync runs **second** with status resolution live, so
+   >   it writes **last** and can walk the card straight off the ladder's target. That is the RAPP-715
+   >   sequence recorded above, not a case ordering prevents.
+   >
+   > **What actually protects the close is block 4** — reading the status back and re-asserting it.
+   > Keep the order because reversing it buys nothing and would need re-arguing; rely on block 4.
+   > Do not reverse these two blocks.
+   >
+   > ⚠️ **The sync does not no-op — it is made status-neutral, and that is why step 3 passes
+   > `--no-transition`.** This block used to claim the sync no-ops on its own — *"the sync's own
+   > transition then finds the issue already in Done and no-ops"* — and that is only true when the
+   > consumer's `jira.statusMap` maps `accepted` to `Done`. **On a project that maps it to anything
+   > else, the sync moved the card BACKWARDS out of the terminal status the ladder just set**, and the
+   > resolution it was closed with was stranded on a non-terminal status, where `resolution IS EMPTY`
+   > sweeps cannot see it either. `--no-transition` removes the second resolver from the path
+   > entirely, rather than correcting after the fact.
+   >
+   > This is not an exotic configuration — **it is the one this very step recommends**. See the
+   > `stage-disabled` row below: *"a board that wants a card to sit in a merge queue until the PR
+   > actually lands should leave `done` to a human"*. A consumer that took that advice is exactly the
+   > consumer this bites. Observed on RAPP-715 (2026-09-05): closed to `Done` + `resolution: Done`,
+   > then the re-link returned it to `Waiting for Review` still carrying `resolution: Done` — matched
+   > by *name*, because that workflow offers a transition literally called `Waiting for Review` and
+   > that name was in the project's `accepted` candidate list.
+   >
+   > Full analysis: [`bug.11`](../../docs/bugs/bug.11.finalise-relink-regresses-terminal-status/bug.11.finalise-relink-regresses-terminal-status.md).
+   > The flag is implemented on `sync-jira-{story,task,epic}` and gated inside `syncDocumentStatus`,
+   > so it holds for every caller of the sync, not just this one.
+
+   1. **Transition to Done** — follow `references/jira-transition-protocol.md` exactly, with
+      `candidates = ["Done", "Closed", "Resolved", "Complete", "Completed"]` and `terminal = true`.
+      That protocol owns the matching order, the required-field handling (a workflow whose Done
+      transition requires a `resolution` is common — it must be sent in the same call), and the
+      MUST-NOT clauses against guessing a fallback transition. Do not re-implement it here.
+      - **Retry once** if the transition call fails with a transport-level error.
+      - If it still fails: post a PR comment (Bitbucket REST API) warning that the Jira issue was
+        not moved to Done, and log in running summary.
+      - If the protocol reports a skip (no matching transition, or a required field it cannot
+        fill): log that reason in the running summary (non-blocking).
+
+   2. **Post completion comment** — build the body from the variables already computed for the PR comment (`FINAL_GATE`, `DOD_PATH`, `CYCLES`) and the per-category `overall_status` values from each DoD agent YAML result, then post it through the CLI. Format:
+
+        ```
+        ## ✅ Story/Task Accepted — Definition of Done Verified
+
+        **PR**: {PR_URL}
+        **QA Gate**: {FINAL_GATE}
+        **Accepted**: {YYYY-MM-DD}
+        **DoD Summary**: `{DOD_PATH}`
+        **QA Cycles**: {CYCLES}    ← omit this line entirely if CYCLES=0
+
+        ### DoD Results
+        | Category | Result |
+        |---|---|
+        | Acceptance Criteria | {ac_overall_status} |
+        | PR Review | {pr_status} |
+        | Security | {security_overall_status} |
+        | Compliance | {compliance_overall_status} |
+        | Documentation | {docs_overall_status} |
+
+        All Definition of Done criteria verified. Story/task accepted and transitioning to Done.
+        ```
+
+        Use ✅ PASS, ❌ FAIL, ⚠️ CONCERNS, or — N/A for each status cell. `{pr_status}` is APPROVED or NOT_APPROVED from the AC agent result.
+
+        ```bash
+        mkdir -p .claude/state
+        # Terminator at COLUMN 0 — an indented terminator does not close an
+        # unquoted heredoc; bash swallows everything after it into the body,
+        # so the call below would never run. Body lines are unindented for
+        # the same reason: leading spaces are written verbatim.
+        cat > .claude/state/comment-body.md <<EOF
+{the body rendered above}
+EOF
+
+        node .agents/skills/finalise/references/tracker-comment.js \
+          --issue {jira_key} --body-file .claude/state/comment-body.md \
+          --stage done \
+          --slot pr="{PR_URL}" \
+          --json
+        ```
+
+> Engine source: `references/tracker-comment.js` (bundled into each skill as `references/tracker-comment.js`). Contract: `references/tracker-comment-contract.md`.
+
+
+        Read `reason` and act per [`references/tracker-comment-contract.md`](references/tracker-comment-contract.md) — only `no-credentials` may fall back to the Atlassian MCP tool. On failure: log warning and continue (non-blocking).
+
+   Log outcome in running summary: "Jira issue {jira_key} transitioned to Done ✅" or the warning detail.
+
+   3. **Re-point the Jira Document link** — the description is ADF (can't be patched in place), so re-run the sync with the durable branch pinned. This is best-effort and additive. It is run with **`--no-transition`**, which makes it link-only: the sync issues no status request at all, so the ladder in step 1 stays the single resolver and the re-link cannot overrule it (bug.11):
+
+   ```bash
+   WORKITEM=story   # set to "task" when finalising a task
+   if [ -n "$JIRA_URL" ] && [ -n "$JIRA_API_TOKEN" ]; then
+     # sync-jira-{story|task} (same script the create/sync flow uses)
+     # --no-transition is REQUIRED here, not optional tidiness. Without it the
+     # sync resolves `accepted` through its own loadStatusMap and can walk the
+     # card back out of the terminal status step 1 just set (bug.11).
+     node .agents/skills/sync-jira-${WORKITEM}/scripts/sync-jira-${WORKITEM}.js \
+       -f "$DOC_PATH" --doc-branch "$DURABLE_BRANCH" --no-transition --quiet \
+       && echo "✅ Jira Document link re-pointed to ${DURABLE_BRANCH}" \
+       || echo "⚠️ sync-jira re-link failed — the transition in step 1 already ran; re-sync from develop after merge"
+   else
+     echo "ℹ️ JIRA_* env not set — skipping Document-link refresh; re-sync from develop after merge to pin a durable link"
+   fi
+   ```
+
+   4. **Confirm the terminal status — still MANDATORY, and read it back rather than assuming.** With
+      `--no-transition` in step 3 the re-link no longer moves the card, so this is now a confirmation
+      rather than a repair of expected damage. **Keep it — this block is what actually protects the
+      close.** It is one cheap read; it catches an older *finalise* copy whose step 3 omits the flag
+      (the sync then runs second and can undo step 1), and anything outside this step that moved the
+      card; and step 1's own `204` is a statement about step 1, not about the state the step ends in.
+      Check, and repair if needed:
+
+   ```bash
+   POST_SYNC=$(curl -s -u "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" -H "Accept: application/json" \
+     "${JIRA_URL}/rest/api/3/issue/${JIRA_KEY}?fields=status,resolution" \
+     | python3 -c 'import sys,json; f=json.load(sys.stdin)["fields"]; print(f["status"]["name"])')
+   ```
+
+   - Terminal (`Done`/`Closed`/whatever step 1 targeted) → nothing to do.
+   - **Anything else** → step 1's close was undone. This should no longer be reachable through step 3
+     as written above. The reachable causes are a **finalise copy older than this one** (whose step 3
+     omits the flag, so the sync still resolves status), or something outside this step moving the
+     card. Note that a `sync-jira-*` too old to know the flag does *not* cause this — it rejects
+     `--no-transition` with `Unknown option` and exits without touching the status. Re-run the step-1
+     transition, supplying the same required fields (a `resolution` is the common one), then
+     **re-read again** to confirm. Log in the running summary: *"re-asserted terminal status after
+     the Document-link re-point (bug.11)"*.
+
+   Never report the close on the strength of step 1 alone once step 3 has run — a `204` from step 1 is
+   a statement about step 1, not about the state the step ends in.
+
+   `${WORKITEM}` is `story` or `task` depending on the document being finalised.
+
+   **GitHub path** (when `TRACKER=github`):
+
+   - Extract `github_issue` number from story/task frontmatter
+   - Get the repository owner (org) via: `gh repo view --json owner --jq '.owner.login'`
+   - Get the repository name via: `gh repo view --json name --jq '.name'`
+   - **Re-point the `## Document` link to `$DURABLE_BRANCH`** — surgically swap just the branch segment of the link (anchored on the doc's repo-relative path, so nothing else in the body changes):
+
+   ```bash
+   CUR_BODY=$(gh issue view {github_issue} --json body -q '.body')
+   # Escape regex metacharacters in the path, then rewrite blob/<any-branch>/<path> → blob/$DURABLE_BRANCH/<path>.
+   # The branch segment uses [^) ]+ (not [^/]+) so multi-segment branch names like feature/story.5.1.foo match.
+   DOC_REL_RE=$(printf '%s' "$DOC_REL" | sed 's/[.[\*^$/]/\\&/g')
+   NEW_BODY=$(printf '%s' "$CUR_BODY" | sed -E "s#blob/[^) ]+/(${DOC_REL_RE})#blob/${DURABLE_BRANCH}/\1#g")
+   if [ "$NEW_BODY" != "$CUR_BODY" ]; then
+     mkdir -p .claude/state
+     printf '%s' "$NEW_BODY" > .claude/state/issue-body.md
+     node references/tracker-issue.js --kind edit --issue {github_issue} \
+       --body-file .claude/state/issue-body.md \
+       && echo "✅ Document link re-pointed to ${DURABLE_BRANCH}" \
+       || echo "⚠️ Document-link re-point failed — non-blocking; re-sync from develop after merge"
+   fi
+   ```
+
+   - Close the issue and verify closure:
+
+   ```bash
+   # Post completion comment — always --body-file, never an inline --body.
+   #
+   # The heredoc terminator sits at COLUMN 0 even though this block is indented
+   # inside a numbered list. Bash does not accept an indented terminator for an
+   # unquoted heredoc: it warns "here-document delimited by end-of-file" and
+   # swallows everything after it INTO THE BODY, so the close below would never
+   # run and the issue would be neither commented nor closed — silently.
+   mkdir -p .claude/state
+   cat > .claude/state/comment-body.md <<EOF
+Story/task development complete — PR: {PR_URL}. Status: accepted. All DoD criteria verified.
+EOF
+   node references/tracker-comment.js --issue {github_issue} \
+     --body-file .claude/state/comment-body.md --stage done \
+     --slot pr="{PR_URL}" \
+     --json
+
+   # Close the issue
+   node references/tracker-issue.js --kind close --issue {github_issue} --reason completed
+   ```
+
+   > **`pr` is the only slot `done` reads.** Pass the URL, not the number — the lead names it for a
+   > reader deciding whether anything is left to do, and a bare `#412` tells them nothing they can act
+   > on.
+   >
+   > The close no longer carries `--comment`. The completion comment is posted by
+   > `tracker-comment.js` immediately above, which is the marked, idempotent path —
+   > a `--comment` on the close is an *unmarked* second comment that the marker
+   > cannot see, so it recurs on every resume.
+
+   After closing, verify the issue is actually closed:
+
+   ```bash
+   ISSUE_STATE=$(gh issue view {github_issue} --json state -q '.state')
+   if [ "$ISSUE_STATE" = "CLOSED" ]; then
+     echo "✅ GitHub Issue #{github_issue} confirmed closed"
+   else
+     echo "⚠️ GitHub Issue #{github_issue} still open — state: $ISSUE_STATE"
+   fi
+   ```
+
+   On any `gh issue close` failure: retry once. If still failing, log the error in the Decisions Log and Issues Log, and post a PR comment: "⚠️ Issue #{github_issue} could not be closed automatically — please close manually."
+
+   Log outcome in running summary: "GitHub Issue #{github_issue} — close: {CLOSED ✅ / OPEN ⚠️ (manual action required)}."
+
+   - **Signal the `done` stage** — run the deterministic CLI rather than a hand-rolled board mutation:
+
+   ```bash
+   node .agents/skills/finalise/references/gh-stage.js \
+     --issue <github_issue> --stage done --json
+   ```
+
+   Engine source: `references/gh-stage.js` (bundled into this skill as `references/gh-stage.js`). Note the path is `finalise`-local — the `{develop-story|develop-task|develop-bug}` brace form used by the pipeline step files does not cover this skill.
+
+   The column this lands in comes from `pipeline.done` in the consumer's `tracker-workflow.yaml`, and the option is matched case-insensitively — a board whose column is `done` or `DONE` resolves exactly as `Done` does. Run `gh-stage.js --probe-board` to see a board's real options.
+
+   - **Branch on `reason` in the JSON:**
+
+     | `reason` | Meaning | Action |
+     | --- | --- | --- |
+     | `transitioned` | Card moved to the resolved column | Record success in the running summary |
+     | `already` | Card was already there | Record success — no mutation was needed |
+     | `stage-disabled` | Consumer omitted `done:` from `pipeline:` | **Success, not a warning** — a human moves this card by design |
+     | `would-regress` | A human advanced the card past Done | Record as informational — the board is ahead of the pipeline |
+     | `no-option` | Board has no column matching the `done` moment | Record a warning in the running summary |
+     | `no-options` | The Status field exists but has no options at all | Record a warning — the board is misconfigured |
+     | `no-status-field` | The board has no Status field | Record a warning — nothing to move |
+     | `ambiguous-board` | The issue is on more than one board and no board was selected | Record a warning naming the candidate boards. **Not an error** — a multi-board setup is ordinary. Fix by setting `github.projectBoard` in `skills-config.yaml` or `project_board_number` in `project.yml` |
+     | `board-unreadable` | The board read failed (API/permissions) | Record a warning with the CLI's message |
+     | `no-repo-context` | `gh repo view` could not resolve the repository | Record a warning — usually a detached checkout or missing `gh` auth |
+     | `no-credentials` | `gh` is not authenticated | Record a warning — the card was not moved |
+     | `deferred` | `access.tracker` is not `full`, so the CLI declined the move and recorded it instead | **Not an error — a recorded outcome.** The run is operating under a declared restriction; the move was never going to happen and the deferral is the system working. Record it in the running summary naming the record id from the JSON's `record` field, then **escalate via the `not-on-board` path below**, pointing at the handover checklist rather than the board |
+     | `not-on-board` | Issue is on no project board | **Escalate — see below** |
+     | `mutation-failed` | The CLI already retried and still failed | Escalate — see below |
+     | _any other value_ | A reason added to the CLI since this table was written | Log it verbatim in the running summary and treat as a non-blocking warning. Never treat an unrecognised reason as success |
+
+     The CLI exits 0 for every row above, so never treat a zero exit as proof the card moved; read `reason`. Reasons produced only by `--probe-board`, `--write-ladder`, `--dry-run` or `--add-to-board` (`probe`, `write-failed`, `exists`, `dry-run`) cannot occur here — this call passes none of those flags.
+
+   - **If `reason` is `not-on-board`:**
+     - Do NOT silently skip. Build the body **once** — the lead above the arm split — then post it with the active `$PLATFORM` branch (GitHub: `gh pr comment <pr-number>` / Bitbucket: REST POST as in Step 6):
+       ```bash
+       LEAD=$(node references/stakeholder-summary-cli.js --stage board-warning \
+         --slot what="The card for this work was not found on any board, so it could not be moved to Done automatically") || exit 1
+       PR_COMMENT_BODY=$(printf '⚠️ Project Board Not Updated\n\n%s\n\n---\n\n%s' "$LEAD" \
+         "This story/task was accepted but GitHub issue #<github_issue> was not found on any project board — the board status was **not** moved to Done automatically.
+
+       **Action required:** manually move the card to Done on the project board, or add the issue to the board first.")
+       ```
+     - Record this as a warning (not a blocker) in the running summary.
+
+   - **If `reason` is `deferred`:** reuse the escalation above with the wording below. It is the same shape — the board did not move and a human must move it — but the *cause* is a policy the operator themselves declared, so the message must not read as a malfunction:
+       ```bash
+       LEAD=$(node references/stakeholder-summary-cli.js --stage board-warning \
+         --slot what="Moving the card to Done was deliberately recorded for someone to do later, rather than done automatically") || exit 1
+       PR_COMMENT_BODY=$(printf '⏸️ Project Board Move Deferred\n\n%s\n\n---\n\n%s' "$LEAD" \
+         "This story/task was accepted. \`access.tracker\` is set to **<access>**, so the board move to **Done** was recorded rather than performed — recorded as \`<record>\`.
+
+       **Action required:** run the handover checklist committed beside the implementation report (\`*.handover.*.sh\` to apply, \`*.handover.*.md\` to do it by hand). Moving the card to Done on the project board is one of its entries.")
+       ```
+       Take `<access>` and `<record>` from the CLI's JSON. **Never post this without the record id** — a deferral the operator cannot locate in the journal is indistinguishable from a silent skip, which is the failure the whole deferred-mutation mechanism exists to remove. The lead does **not** carry the record id and is not a substitute for it: the lead says a human must act, the body says which record tells them what to do. Both are required.
+       The `what` clause says *deliberately* recorded, because this notice is the one of the three that is not a malfunction — a deferral is the operator's own declared policy working as intended, and a lead that read as breakage would misreport it.
+     - Record it in the running summary as a deferral, **not** as a failure. The Definition of Done is unaffected: a card that a declared restriction stopped the pipeline moving is not an incomplete task.
+
+   - **If `reason` is `mutation-failed`:** build the body **once** — the lead above the arm split — then post it with the active `$PLATFORM` branch (GitHub: `gh pr comment <pr-number>` / Bitbucket: REST POST as in Step 6):
+       ```bash
+       LEAD=$(node references/stakeholder-summary-cli.js --stage board-warning \
+         --slot what="The attempt to move the card to Done failed") || exit 1
+       PR_COMMENT_BODY=$(printf '⚠️ Project Board Update Failed\n\n%s\n\n---\n\n%s' "$LEAD" \
+         "This story/task was accepted but the attempt to move GitHub issue #<github_issue> to **Done** on the project board failed.
+
+       **Error details:** \`<paste the CLI's JSON output>\`
+
+       **Action required:** manually move the card to Done on the project board.")
+       ```
+     - Record the failure (and the error detail) in the running summary. The CLI has already retried internally — do not re-run it.
+
+8. **Communicate to User:**
+   - Display a success message with summary of completion
+   - Show path to updated story document
+   - Show path to Sprint Review summary
+   - Confirm PR comment was posted
+   - Confirm tracker issue closed/transitioned to Done (GitHub: issue closed + state verified; Jira: transitioned via MCP) — or note failure with manual action required
+   - Confirm project board item was moved to Done (GitHub only — or note if not found on any board)
+
+**Step 7 Completion Checklist — tick off each before moving on:**
+
+- [ ] Running summary file finalized — `## Verification Complete` appended with `**Final Status:** ✅ ACCEPTED`, and that is the file's only status line (the header carries none)
+- [ ] Story frontmatter updated: `status: accepted`, `updated`, `completed_date`, `pr_number`
+- [ ] Task only: registry row ticked — `registry-tick.js` reported `ticked` / `already` / `no-registry` (a `no-row`, `row-malformed`, `ambiguous-row` or `engine-unavailable` needs a manual tick before merge, or CI's drift check fails)
+- [ ] DoD PASSED section added to story document body
+- [ ] Running summary referenced in DoD section
+- [ ] Sprint Review summary file created at `{story-directory}/sprint-review-summary.md`
+- [ ] **Publish boundary (6a–6c) crossed before any side-effect**: acceptance commit made with output and exit status read (never suppressed), pushed; document, DoD summary and sprint review asserted **tracked and on `origin/<branch>`** (`git ls-files --error-unmatch` + `git show origin/<branch>:<path>`), not merely present; PR head equals the pushed head; **CI reading 2 read `SUCCESS` on that head** — anything else is HALT `ci-not-green-on-acceptance-head`, with no comment, close or board move issued
+- [ ] Both CI readings recorded with their heads — reading 1 in the running summary (Step 6), reading 2 on the PR canonical comment and in the implementation report
+- [ ] CHANGELOG citation checked (6d) — `(task N)` present under `[Unreleased]`, or the `no-changelog-entry` warning surfaced
+- [ ] PR comment posted (GitHub: `gh pr comment`, Bitbucket: REST API) — **after** 6a–6c
+- [ ] Tracker issue closed: Jira issue transitioned via MCP (`transitionJiraIssue`) **OR** GitHub issue closed via `gh issue close` + closure confirmed with `gh issue view --json state` **OR** warning comment posted (if close failed after retry)
+- [ ] **Jira only — terminal status RE-READ after the Document-link re-point**, and re-asserted if the
+      sync walked it back (bug.11). A `204` from the close is evidence about the close, not about the
+      state this step ends in
+- [ ] Tracker board updated: Jira — N/A (handled by transition above) **OR** GitHub project board item moved to Done via GraphQL mutation **OR** warning comment posted (if mutation failed after retry)
+- [ ] Running summary records issue close outcome AND board update outcome (success, failure, not-found — with detail)
+- [ ] User notified with success message, artifact paths, PR comment link, and board update status
+
+### Step 8: Report Gaps (In Progress)
+
+If any DoD criteria are not met, finalize the running summary with gaps, keep the story/task in "In Progress", and report specific gaps.
+
+**Actions:**
+
+1. **Finalize Running Summary File with Gaps:**
+   - Append the `## Verification Complete` section below — its `**Final Status:**` line is the
+     file's **only** status line (the header carries none; see Step 0)
+   - Summarize blocking issues and estimated effort
+   - Add timestamp
+
+   **Example final append for gaps:**
+
+   ```markdown
+   ## Verification Complete
+
+   **Final Status:** ❌ GAPS IDENTIFIED - NOT ACCEPTED
+
+   **Completion Time:** {current-date-time}
+   **Total Duration:** {duration}
+
+   **Blocking Issues Summary:**
+
+   1. QA Gate: FAIL status (3 blocking security issues from QA)
+   2. AC3: Success message not implemented
+   3. No PR number in story document
+   4. Security: Input validation missing for email field (XSS risk)
+   5. Security: Password strength requirements not enforced
+   6. Compliance: GDPR consent flow not implemented
+
+   **Estimated Effort to Close Gaps:** Large (6-8 hours)
+
+   **Artifacts Generated:**
+
+   - ✅ Gap report added to story document
+   - ✅ PR comment posted (if applicable)
+
+   **Next Steps:**
+
+   - Address blocking issues listed above
+   - A gap closed by changing code re-enters QA before this verification re-runs; a document-only fix re-runs it directly
+   - Re-run verification after fixes are implemented
+   ```
+
+   **Bug mode (`gaps-verification-complete`):** run — **fill**, never append, through the same
+   helper 7.1 uses, with the verdict `gaps`. The bug DoD template already carries the block, so an
+   append here doubles the heading exactly as 7.1's once did (obs #148). Write the gaps first, each as
+   a `- [ ] {gap}` line replacing the `**Outcome:**` placeholder under `## Step 5: Acceptance
+   Decision` — 8.3 and 8.5 read and count those lines — then fill. The helper refuses a file with
+   no gap line **before** it writes anything, so a missing gap list stops the run here, ahead of
+   the two writes that cannot be undone (this fill, and 8.3's row):
+
+   ```bash
+   DOD_PATH="{dod-path — the running summary Step 0 created}"
+   case "$DOD_PATH" in *'{'*) echo "HALT: DOD_PATH must be bound in this block"; exit 1 ;; esac
+   bash .agents/skills/finalise/references/fill-verification-complete.sh "$DOD_PATH" gaps || exit 1
+   ```
+
+2. **Do NOT Update Story Status:**
+   - Keep the current status (e.g., `in_progress`, `code_review`, `testing`)
+   - Do NOT mark as `accepted`
+
+3. **Append the gaps row to `## Change Log`** — and bump frontmatter `updated`:
+
+   ```markdown
+   | 2026-05-15 |  | DoD incomplete — 3 gaps identified | finalise |
+   ```
+
+   **`Version` stays blank here.** The status is deliberately unchanged on this path, so there is
+   no revision to bump — the minor bump belongs only to the acceptance row in Step 7. A gaps row
+   records that finalise ran and what it found, which is exactly the history a reader needs when
+   the next run does accept. Canonical format:
+   [document-change-log.md](references/document-change-log.md).
+
+   **Bug mode (`gaps-change-log-row`):** skip — **forbidden**, on the same grounds as
+   `change-log-row` in 7.3: bug reports never carry a Change Log.
+
+   **Bug mode (`gaps-status-history-row`):** run — the bug counterpart of the gaps row is a
+   `## Status History` row, through the same engine 7.3 uses. The status is unchanged, as it is on
+   this whole path:
+
+   ```bash
+   DOC_FILE="{the bug report path}"
+   BUG_STATUS="{the bug's current status, unchanged — as bug-doc.js reports it}"
+   DOD_PATH="{dod-path — the running summary Step 0 created}"
+   # The inputs are bound HERE and refused while a placeholder survives: an unsubstituted status
+   # would otherwise be written as a literal row.
+   case "$DOC_FILE|$BUG_STATUS|$DOD_PATH" in
+     *'{'* | '|'* | *'||'* | *'|') echo "HALT: DOC_FILE, BUG_STATUS and DOD_PATH must be bound in this block"; exit 1 ;;
+   esac
+   # The count and the file name are DERIVED from the DoD file 8.1 filled, never supplied: the
+   # helper's `count` is the one definition of "the gap list".
+   GAP_TOTAL=$(bash .agents/skills/finalise/references/fill-verification-complete.sh "$DOD_PATH" count) || exit 1
+   # 8.1 refused a DoD with no gap line before its fill, so 0 here means the file changed since.
+   [ "$GAP_TOTAL" -gt 0 ] || { echo "HALT: bug mode — $DOD_PATH carries no gap line; 8.1 writes them before the fill"; exit 1; }
+   DOD_NAME=$(basename "$DOD_PATH")
+   node .agents/skills/finalise/references/status-history.js --file "$DOC_FILE" --json \
+     --date "$(date -u +%Y-%m-%d)" --status "$BUG_STATUS" \
+     --changed-by finalise --notes "DoD incomplete — $GAP_TOTAL gap(s) — $DOD_NAME"
+   ```
+
+   Read `reason`: `updated` is success (exit 0); `usage` (exit 2) is a HALT — the call is wrong,
+   not the bug report. The engine **appends** and never deduplicates, so a re-run of this block
+   writes a second row: it cannot report `unchanged`, and a resumed run must check the table for
+   today's row before calling it again.
+
+4. **Add Gap Report to Document Body:**
+   - Add a "## Definition of Done - Gaps Identified" section
+   - Place it the same way as 7.4: immediately before the change-log block, never between the markers
+   - List all specific gaps by category
+   - **If QA reports exist**, include QA gate findings and top issues
+   - Provide actionable next steps
+   - Estimate effort to close gaps (Small/Medium/Large)
+
+   **Bug mode (`gaps-body-section`):** skip — the gap report is the DoD file's `## Step 5` section,
+   written at 8.1. A `## Definition of Done - Gaps Identified` section in the bug report would be a
+   second verdict, the same reason `body-dod-section` skips at 7.4–7.5.
+
+   **Example Gap Report with QA Gate (use format from `references/definition-of-done-checklist.md`):**
+
+   ```markdown
+   ## Definition of Done - Gaps Identified
+
+   **Status:** IN PROGRESS
+
+   ### QA Gate Status
+
+   **QA Report**: `story.311.2.qa.1.initial-review.md`
+   **Gate File**: `story.311.2.gate.1.initial-review.yml`
+   **Gate Status**: ❌ FAIL
+   **Quality Score**: 45/100 (NEEDS IMPROVEMENT)
+
+   **Top Issues from QA:**
+
+   1. ⚠️ Security: Input validation missing for email field (XSS risk) - **BLOCKING**
+   2. ⚠️ Security: Password strength requirements not enforced - **BLOCKING**
+   3. ⚠️ Tests: No unit tests found for authentication service - **BLOCKING**
+
+   ### Missing Criteria:
+
+   1. **Acceptance Criteria:**
+      - [ ] Success message appears after submission (not yet implemented)
+
+   2. **Unit Tests:**
+      - ⚠️ No PR number found in document. Please link the PR.
+      - ⚠️ No unit tests found (flagged by QA as blocking)
+
+   3. **Documentation:**
+      - ⚠️ API endpoint documentation not updated in Swagger spec
+
+   4. **Security Review:**
+      - ⚠️ Input validation missing for email field (XSS risk) - **QA BLOCKING**
+      - ⚠️ Password strength requirements not enforced - **QA BLOCKING**
+
+   5. **Compliance Review:**
+      - ⚠️ GDPR: No user consent flow implemented for data collection
+
+   ### Next Steps:
+
+   - [ ] **BLOCKING**: Implement input validation for email field
+   - [ ] **BLOCKING**: Add password strength validation
+   - [ ] **BLOCKING**: Add unit tests for authentication service
+   - [ ] Complete success message feature
+   - [ ] Add PR link to story document
+   - [ ] Update Swagger API documentation
+   - [ ] Add user consent flow for GDPR compliance
+
+   **Estimated Effort:** Large (6-8 hours) - includes 3 blocking security issues
+
+   **Gap Report Generated:** 2025-02-01
+   **QA Gate Reference**: See `story.311.2.gate.1.initial-review.yml` for full details
+
+   **Detailed Verification Log:** See `story.311.2.dod.1.transaction-event-history.md` for complete verification evidence and timestamps.
+   ```
+
+5. **Add PR Comment (if PR exists):**
+   - Build the body **once**, with the lead above the arm split, then post it with the active `$PLATFORM` branch (GitHub: `gh pr comment <pr-number>` / Bitbucket: REST POST as in Step 6)
+   - Request changes to address gaps
+
+   **Bug mode (`gaps-pr-comment`):** run — the block reads the gap body from the DoD file's
+   `## Step 5: Acceptance Decision` section when `DOC_KIND=bug`: 8.4 wrote no body section, so the
+   story/task source would be empty and the post-condition below would refuse to post.
+
+   ```bash
+   # Bind the values this block interpolates, HERE, before use. Step 4 writes the
+   # gap report into the document body (bug mode: 8.1 writes it into the DoD file);
+   # neither leaves it in a variable, so capture it back out of the file rather than
+   # assuming it is in scope.
+   #
+   # An unbound name does NOT fail here — it expands to the empty string, the
+   # numeric slot is silently dropped, and the comment posts as a heading, a lead
+   # and a bare horizontal rule with no gaps under it. That is the silent shape
+   # this whole page keeps warning about, so the binding is not optional tidiness.
+   DOC_KIND="{story | task | bug — the kind the Document-kind block resolved}"
+   DOC_FILE="{story-or-task-file}"
+   DOD_PATH="{dod-path — the running summary Step 0 created}"
+   case "$DOC_KIND" in *'{'* | '') echo "HALT: DOC_KIND must be bound in this block"; exit 1 ;; esac
+   # Bounded to the section: set the flag AFTER the heading (`next`), and clear it
+   # at the NEXT `## ` heading. Without the stop condition this captures to
+   # end-of-file — dragging Change Log, Progress Tracking, References and Notes
+   # into the comment, and counting THEIR checkboxes as gaps. Measured on a
+   # two-gap fixture: 5 counted instead of 2, four unrelated sections pasted in.
+   if [ "$DOC_KIND" = "bug" ]; then
+     # Bug mode (gaps-body-section skips 8.4): the gaps live in the DoD file's Step 5.
+     case "$DOD_PATH" in *'{'* | '') echo "HALT: DOD_PATH must be bound in this block"; exit 1 ;; esac
+     GAP_REPORT_BODY=$(awk '/^## Step 5: Acceptance Decision/{f=1;next} /^## /{f=0} f' "$DOD_PATH")
+   else
+     case "$DOC_FILE" in *'{'* | '') echo "HALT: DOC_FILE must be bound in this block"; exit 1 ;; esac
+     GAP_REPORT_BODY=$(awk '/^## Definition of Done - Gaps Identified/{f=1;next} /^## /{f=0} f' "$DOC_FILE")
+   fi
+   # Unmet criteria across every section of the gap report — an unchecked box,
+   # indented too: 8.4's example nests them under a numbered list (obs #212).
+   # `grep -c` prints 0 and EXITS 1 when it matches nothing, so `|| true` (never
+   # `|| echo 0`, which would append a second zero and make the value "0\n0").
+   if [ "$DOC_KIND" = "bug" ]; then
+     # The helper's `count` is the one definition of the bug-mode gap list (8.1, 8.3 and here).
+     GAP_COUNT=$(bash .agents/skills/finalise/references/fill-verification-complete.sh "$DOD_PATH" count) || exit 1
+   else
+     GAP_COUNT=$(printf '%s' "$GAP_REPORT_BODY" | grep -c '^[[:space:]]*- \[ \]' || true)
+     GAP_COUNT=${GAP_COUNT:-0}
+   fi
+   # Bug mode: the template always fills Step 5 (Decision, QA record, CI rollup), so the
+   # empty-body post-condition below can never fire there. 8.1's helper already refused a DoD
+   # with no gap line before its fill; this is the backstop for a DoD edited after it.
+   if [ "$DOC_KIND" = "bug" ] && [ "$GAP_COUNT" -eq 0 ]; then
+     echo "HALT: bug mode — no '- [ ]' gap line under Step 5 Outcome in $DOD_PATH; 8.1 writes them before the fill"; exit 1
+   fi
+
+   # Omit nothing: the catalogue drops a zero as absent, so a count of 0 renders
+   # the shorter true sentence rather than "(0 of them)".
+   LEAD=$(node .agents/skills/finalise/references/stakeholder-summary-cli.js --stage dod-gaps --slot count="${GAP_COUNT}") || exit 1
+   PR_COMMENT_BODY=$(printf '## ⚠️ Definition of Done - Gaps Identified\n\n%s\n\n---\n\n%s' "$LEAD" "$GAP_REPORT_BODY")
+
+   # Post-condition: refuse to post a body whose gap section is empty. A reviewer
+   # reading "gaps identified" with nothing under the rule learns nothing and is
+   # told nothing is wrong.
+   [ -n "$GAP_REPORT_BODY" ] || { echo "gap report body is empty — not posting"; exit 1; }
+   ```
+
+   > This is the one pull-request comment on this page that says the work is **not** finished, and
+   > it is the one a stakeholder is most likely to misread as a failure. `dod-gaps` says what is
+   > true and what happens next — some checks are outstanding, they are listed, the work comes back
+   > — without a verdict token or a score. Do not substitute the `done` lead here.
+
+   **Example PR Comment** (the lead, then the rule, then the body unchanged):
+
+   ```markdown
+   ## ⚠️ Definition of Done - Gaps Identified
+
+   This work is not finished yet. Some of the checks it has to pass are still outstanding (7 of them),
+   and they are listed below. It will come back here once they have been dealt with.
+
+   ---
+
+   This story/task cannot be marked as Accepted due to the following gaps:
+
+   **Acceptance Criteria:**
+
+   - [ ] Success message appears after submission
+
+   **Documentation:**
+
+   - API endpoint documentation not updated in Swagger spec
+
+   **Security:**
+
+   - Input validation missing for email field (XSS risk)
+   - Password strength requirements not enforced
+
+   **Compliance:**
+
+   - GDPR: No user consent flow implemented
+
+   Please address these gaps before requesting acceptance.
+
+   **Full gap report:** See story document for complete details and next steps.
+   ```
+
+6. **Communicate to User:**
+   - Display a clear message that the story is NOT ready for acceptance
+   - List all gaps in a readable format
+   - Suggest next steps to close the gaps
+   - Estimate effort required
+
+### Step 8a: Fix-and-recheck (bounded — once per run, and only when the evaluator says so)
+
+**When this step applies.** Step 6 would decide IN PROGRESS **solely** because one of the four DoD
+sections (acceptance criteria, docs, security, compliance) is FAIL on a finding **this run produced by
+execution** — a reproduced probe, a failing check with a citation — and nothing else is wrong. If
+two sections are FAIL, or the QA gate is FAIL, or CI is not green on the current head, this step does
+not apply: take Step 8 — with one named exception to the CI clause, stated in full in the next
+paragraph: a red on the docs link checker alone, on the work item's own document or a co-located
+`.md` pipeline artifact (its QA report, DoD, implementation report, review or PR review).
+
+**One CI red is a Docs-section finding, not a CI verdict: a dead relative link inside the work
+item's own document or one of its co-located pipeline artifacts (task.139, obs #154; task.152,
+obs #155).** `docs-link-check` runs only on files the PR changed, so
+a work-item document that quotes a skill's prose *including the skill's relative link* fails CI on
+the document itself — after the whole pipeline, since `review-*` checked that paths exist rather
+than that links resolve from here, and the QA reviewer excludes the document from its diff. That
+red is about one line of the document, not about the code, and it is the shape this step exists for.
+The artifacts the pipeline writes beside the document are the same shape and more common: CI reads
+every changed `docs/**/*.md`, and a QA report that quotes a finding containing a bracket-paren span
+renders it as a live link (task.139 run 2 went red on `task.139.qa.4` and `qa.5` and halted, because
+this clause then admitted the document alone).
+It qualifies **only** when all of these hold, each verified rather than assumed:
+
+- `CI_ROLLUP` is `FAILURE` because of the **docs link checker alone** — every other check on the
+  head is `SUCCESS`, `SKIPPED` or `NEUTRAL` (a still-running lane is `PENDING`, and this step
+  waits for it like any other reading; it does not round it up).
+- The engine (`references/doc-links.js`, bundled beside this skill) reproduces the red on the
+  work-item document and/or its co-located artifacts, and **on nothing else in the diff**:
+  `node .agents/skills/finalise/references/doc-links.js --file "{document-or-artifact-path}"` (run
+  from the repository root, like every engine call in this skill) exits 1 on each reproduced file,
+  and the same call on every other `.md` the PR changed exits 0. A co-located artifact is a `.md`
+  file in the document's own directory that is either the unprefixed `sprint-review-summary.md`
+  finalise writes there, or a file whose name starts with the document's id and is a pipeline
+  artifact (`.qa.`, `.dod.`, `.implementation.`, `.review.`, `.pr-review.` …) — never a
+  `.bug.` report, which is a work item of its own. A dead link in a skill or a shared resource is a
+  code finding and takes the ordinary halt.
+- The finding record's `severity` is `low`, its `touched` is exactly the reproduced files, and
+  the record carries `"documentPath"` — and, for each reproduced artifact, an entry in
+  `"artifactPaths"`, which the evaluator admits only when it is co-located with `documentPath`
+  (same directory, same id stem; `isCoLocatedArtifact`). Every one of these paths is the
+  **repository-root-relative** path (`docs/tasks/…/task.N.x.md`), which is also what `touched` and
+  `mutationProof.test` must read: the evaluator compares against git's
+  root-relative paths and the engine prints its `✖` lines root-relative whatever `--file` received,
+  so take the value from the engine's `--json` output `file` field rather than from an absolute or
+  `./`-prefixed argument (5c run 2, CR-1). `filesSummary` stays what is on disk (task § 7 /
+  the story's File List — which, as the norm, omits the document it lives in); the evaluator's
+  `inside-files-summary` treats the work item's own document as always in scope when
+  `documentPath` names it, so the scope claim is enforced by the engine rather than declared by
+  the record (QA cycle 3, CR-5). `documentPath` is required even when the red is on artifacts only:
+  it is the anchor every `artifactPaths` entry is checked against.
+- The mutation proof is the engine itself: the **pre-fix** run of `doc-links.js` on **every**
+  reproduced file, appended to `mutationProof.run` in turn before the edit, is the red (each prints
+  `✖ <file>:<line> → …` and `FAIL doc-links: …`, which are the markers the evaluator reads, on lines
+  naming the file — so `mutationProof.test` is the **first** reproduced file, whose name already
+  sits beside a red marker); the **post-fix** run on each exits 0. Reverting the
+  edit and re-running is the same proof a second time, and is what `redOnRevert: true` asserts.
+
+Then Steps 8a.1–8a.5 run unchanged, with the Docs section as the failed section and the engine run
+as its reproduction, and Step 6 is re-entered on the fix head — whose `link-check` must be
+`SUCCESS` in the retaken CI reading 1. Nothing here relaxes the CI gate on the acceptance head:
+reading 2 (6c) is taken exactly as before.
+
+**1. Build the finding record and run the evaluator.** `severity`, `filesSummary` and
+`otherFindingsOpen` come from things already on disk. `commits` and `touched` are the **plan** at
+this point — the fix does not exist yet — and the evaluator is run a **third** time after the commit
+with `--git-base` so both are re-read from git before anything is pushed (step 2b):
+
+```bash
+mkdir -p .claude/state
+cat > .claude/state/finalise-fix-finding.json <<'JSON'
+{
+  "severity": "{the finding's severity, from the agent YAML — copy it; leave the key out if the agent gave none}",
+  "commits": 1,
+  "touched": ["{every path the fix will change, repo-relative}"],
+  "filesSummary": [{every path in the work item's Files Summary (task §7) / File List (story), as strings}],
+  "documentPath": "{repo-root-relative path of the work item document — only for the docs-link clause; omit otherwise}",
+  "artifactPaths": [{co-located artifacts the docs-link red is on, repo-root-relative — only for the docs-link clause; omit otherwise}],
+  "mutationProof": { "test": "{the test that must go red on revert}", "redOnRevert": false, "run": ".claude/state/finalise-mutation-proof.log" },
+  "otherFindingsOpen": [{every medium-or-higher finding in any section, and every other section that is FAIL — as strings; [] when none}]
+}
+JSON
+node references/finalise-fix-and-recheck.mjs --finding .claude/state/finalise-fix-finding.json --json
+```
+
+`mutationProof.redOnRevert` is `false` at this point — the proof has not run yet — so the first
+evaluation **halts on `mutation-proved`** by construction. That is deliberate: it tells you which
+preconditions are already decided before any code moves. Proceed to step 2 only when
+`mutation-proved` is the **only** id in `failed[]`. Any other id in `failed[]` → Step 8, with the
+line `Fix-and-recheck refused: {ids}` in the gap report's Blocking Issues Summary.
+
+**2. Fix, prove, commit, push — one commit.**
+
+- Implement the fix. Touch only the paths in `touched`.
+- Run the fast gate (`develop.fastGateCommand`, default `npm run ci:fast`) to a file; it must be
+  green.
+- Run the mutation proof per `references/mutation-proving.md`: snapshot the fixed file with `cp`,
+  revert the behaviour, run the named test **with its output captured to the file named in
+  `mutationProof.run`** (`node --test <test> > .claude/state/finalise-mutation-proof.log 2>&1`),
+  confirm it is **red**, restore from the snapshot, confirm green. Set `mutationProof.redOnRevert`
+  to `true` in the finding record and re-run the evaluator — it opens the run file and requires
+  it to be non-empty, to name the test, and to carry a red marker (`not ok` / `✖` / `ℹ fail N`);
+  a flipped boolean with no recorded run halts on `mutation-proved`. **Exit 0 is the licence for
+  the commit; exit 1 is Step 8.**
+- Commit — one commit, message `fix(<stem>): finalise DoD <section> — <finding, one line>`,
+  **path-limited to `touched`**. 5c may have staged the PR review report and doc-only fixes for 6a to
+  carry into the acceptance commit (task.173). A bare `git commit` sweeps them into this fix
+  commit, and the `--git-base` run below then refuses it for a file the record did not name — on
+  healthy work. `--` commits the named paths and leaves the rest of the index staged for 6a:
+
+  ```bash
+  STEM="{story.{epic}.{story} | task.{id} — the work item's filename stem}"
+  MSG_TAIL="{section} — {the finding, one line}"
+  case "$STEM$MSG_TAIL" in *'{'*) echo "HALT: STEM and MSG_TAIL must be substituted in this block"; exit 1 ;; esac
+  # The commit's paths are the record's `touched`, read in THIS block — zsh-safe, no bare glob.
+  TOUCHED=()
+  while IFS= read -r p; do [ -n "$p" ] && TOUCHED+=("$p"); done \
+    < <(command node -e 'for (const p of JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).touched || []) console.log(p)' .claude/state/finalise-fix-finding.json)
+  [ "${#TOUCHED[@]}" -gt 0 ] || { echo "HALT: the finding record names no touched paths"; exit 1; }
+  # Add first: `git commit -- <path>` refuses a path git does not yet know (a new test file).
+  git add -- "${TOUCHED[@]}"
+  ADD_EXIT=$?
+  [ "$ADD_EXIT" -eq 0 ] || { echo "HALT: git add of the touched paths failed (exit $ADD_EXIT)"; exit 1; }
+  git commit -m "fix(${STEM}): finalise DoD ${MSG_TAIL}" -- "${TOUCHED[@]}"
+  COMMIT_EXIT=$?
+  [ "$COMMIT_EXIT" -eq 0 ] || { echo "HALT: 8a fix commit rejected (exit $COMMIT_EXIT) — see output above"; exit 1; }
+  ```
+
+**2b. Re-run the evaluator on the record, then push.** The second run licensed the *commit* on a
+forecast (`"commits": 1` typed before any commit existed; `touched` as the paths the fix *would*
+change). The push is licensed by what git says:
+
+```bash
+node references/finalise-fix-and-recheck.mjs \
+  --finding .claude/state/finalise-fix-finding.json --git-base "$CI_HEAD_1" --json
+```
+
+`--git-base` derives `commits` from `git rev-list --count <base>..HEAD` and `touched` from
+`git diff --name-only <base>..HEAD` and **refuses** a record that disagrees with either — two
+commits, a file the record did not name, a ref git cannot answer. Exit 0 → `git push origin HEAD`;
+exit 1 → Step 8, with the commit left local. To drop it, run `git reset --soft "$CI_HEAD_1"` and then
+`git restore --source="$CI_HEAD_1" --staged --worktree -- <touched>`. Never use `--hard`: it would also
+destroy the 5c review report and any doc-only fixes staged for 6a to carry, which no commit holds
+(task.173 QA-2, CR-3). One exception: a `touched` path that is also a 5c-carried doc fix (listed in
+`.claude/state/5c-carry-eligible.txt`). The fix commit took the 5c edit with it, so the 5c-only content
+survives nowhere: not in the index, not in the tree, not in any commit. Restore the path from
+`CI_HEAD_1`, re-apply the doc-only fix from its finding in the PR review report, and re-run the 5c
+stage block for that path (task.173 QA-4, CR-1). The
+run before the commit cannot do this check, and that is why there are three runs, not two.
+
+**3. Retake CI reading 1 on the fix head.** The decision reading from Step 6 was taken on a commit
+that no longer carries the acceptance. Record `CI_HEAD_1=$(git rev-parse HEAD)` again and re-run the
+Step 6 rollup query **through the background poll** the CI gate already uses — never a foreground
+wait — until it is `SUCCESS`. Record it in the running summary as
+`CI reading 1 (fix head): {CI_ROLLUP} @ {CI_HEAD_1}`. `FAILURE` → Step 8.
+
+**4. Re-run ONLY the failed section's reproduction.** Not the four agents. For security, that is the
+engine command the agent recorded (`security-probe.mjs … --record …`), re-run so the record's
+`totals.executed` is refreshed from the fixed tree; for a checklist FAIL it is the check's own
+citation re-read. The section is PASS when the reproduction no longer reproduces **and** the record
+shows the count. The other three sections were evaluated against a tree the fix did not change — the
+`touched` paths are inside the Files Summary, which is what `inside-files-summary` guarantees — and
+that is **stated**, not assumed, in the block below.
+
+**5. Append the deviations block to the running summary**, then re-enter Step 6 with the section
+PASS and the fix head as `CI_HEAD_1`. Wording, from task.121's `dod.1`:
+
+```markdown
+**Deviations recorded, not hidden:**
+
+1. The {section} fix (`{sha}`) landed during `/finalise`, after the QA loop exited at 5c; it was
+   verified inline — fast gate, mutation proof ({test}: red on revert), the section's reproduction
+   re-run ({command}) — rather than by a further QA cycle or an independent reviewer. The other
+   three DoD sections were not re-run: the fix touched only {touched}, inside the Files Summary,
+   and they were evaluated against a tree those paths did not change.
+2. Fix-and-recheck preconditions: all five held (`finalise-fix-and-recheck.mjs` exit 0 before the
+   commit and again with `--git-base {CI_HEAD_1}` after it; record at
+   `.claude/state/finalise-fix-finding.json`).
+```
+
+**Bounded.** This step runs **once** per `/finalise` run. A second finding — in the re-run section or
+anywhere else — after the first fix takes Step 8, whatever its severity. The path closes one small,
+provable gap under a rule; it is not a develop loop.
+
+**Step 8a Completion Checklist:**
+
+- [ ] Evaluator run three times: first halt on `mutation-proved` only; second exit 0 after the proof (licence to commit); third with `--git-base "$CI_HEAD_1"` exit 0 after the commit (licence to push)
+- [ ] One commit, pushed; `CI reading 1 (fix head)` recorded as SUCCESS
+- [ ] Only the failed section's reproduction re-run, from the record
+- [ ] Deviations block appended to the running summary
+- [ ] Step 6 re-entered on the fix head
+
+**Step 8 Completion Checklist — tick off each before moving on:**
+
+- [ ] Running summary file finalized (status = COMPLETED - GAPS IDENTIFIED)
+- [ ] Story status NOT changed (kept at current status, not set to accepted)
+- [ ] Gap report section added to story document body (bug mode: none — the gaps are the DoD file's Step 5 Outcome lines instead)
+- [ ] PR comment posted on the active platform (GitHub: `gh pr comment` / Bitbucket: REST POST) (skip only if no PR exists)
+- [ ] User notified with clear NOT ACCEPTED message, gap list, and next steps
+
+## Usage Examples
+
+### Example 1: Story Fully Meets DoD
+
+**User Request:**
+
+```
+Mark story.311.1.example-system as complete
+```
+
+**Skill Actions:**
+
+1. Read story document from `${PRD_ROOT}/.../story.311.1.example-system.md`
+2. Check for QA reports - found `story.311.1.qa.1.initial-review.md` ✅
+3. Review QA gate file - `story.311.1.gate.1.initial-review.yml` shows PASS ✅
+4. Verify all acceptance criteria are checked (cross-reference with QA report) ✅
+5. Find PR #789, verify it's approved ✅
+6. Check documentation is updated ✅
+7. Run security checklist for API story type (QA already assessed) ✅
+8. Run compliance checklist (GDPR, accessibility - QA already assessed) ✅
+9. Update story status to `accepted`
+10. Generate Sprint Review summary (including QA findings)
+11. Post acceptance comment to PR #789 (including QA gate status)
+
+**Output:**
+
+```
+✅ Story Accepted - Ready for Sprint Review
+
+**Story:** story.311.1.example-system
+**Status:** ACCEPTED
+**Acceptance Date:** 2025-02-01
+
+**QA Gate Status:** ✅ PASS (Quality Score: 92/100)
+
+All Definition of Done criteria verified:
+- ✅ All 5 acceptance criteria met (verified by QA report)
+- ✅ PR #789 approved by 2 reviewers
+- ✅ Tests in src/notifications/example-action.spec.ts
+- ✅ Documentation updated
+- ✅ Security review passed (API authentication, input validation - QA verified)
+- ✅ Performance review passed (QA verified)
+- ✅ Reliability review passed (QA verified)
+- ✅ Maintainability review passed (QA verified)
+
+**QA Reports:**
+- QA Report: ${PRD_ROOT}/.../story.311.1.../story.311.1.qa.1.initial-review.md
+- Gate File: ${PRD_ROOT}/.../story.311.1.../story.311.1.gate.1.initial-review.yml
+
+**Artifacts Generated:**
+- Updated: ${PRD_ROOT}/.../story.311.1.../story.311.1...md
+- Created: ${PRD_ROOT}/.../story.311.1.../sprint-review-summary.md
+- PR Comment: https://github.com/org/repo/pull/789#comment-xyz
+```
+
+### Example 2: Story Has Gaps
+
+**User Request:**
+
+```
+Check if task.90.swagger-cli-plugin-enablement is ready for acceptance
+```
+
+**Skill Actions:**
+
+1. Read task document from `docs/tasks/task.90.../task.90...md`
+2. Check for QA reports - none found
+3. Verify acceptance criteria - 1 checkbox unchecked ❌
+4. Find PR reference - no PR number found ❌
+5. Check documentation - not mentioned ❌
+6. Run security checklist - input validation missing ❌
+7. Run compliance checklist - N/A for this task type ✅
+8. Generate gap report and add to task document
+9. Do NOT change status (remains `in_progress`)
+
+**Output:**
+
+```
+⚠️ Task NOT Ready for Acceptance - Gaps Identified
+
+**Task:** task.90.swagger-cli-plugin-enablement
+**Current Status:** in_progress
+
+**Gaps Identified:**
+
+1. Acceptance Criteria:
+   - [ ] CLI plugin generates Swagger spec correctly (not yet implemented)
+
+2. Unit Tests & PR:
+   - No PR number found in document
+
+3. Documentation:
+   - Plugin usage documentation not mentioned
+
+4. Security:
+   - Input validation missing for API endpoint parameters
+
+**Next Steps:**
+- Complete Swagger spec generation feature
+- Create and link PR in task document
+- Add plugin usage guide to docs/
+- Implement input validation for API parameters
+
+**Estimated Effort:** Medium (3-5 hours)
+
+**Gap report added to:** docs/tasks/task.90.../task.90...md
+```
+
+### Example 3: Directory Path Provided
+
+**User Request:**
+
+```
+Verify DoD for ${PRD_ROOT}/ui-domain/module-name/epics/epic.311.example-integration/stories/story.311.2.example-notifications/
+```
+
+**Skill Actions:**
+
+1. Use Glob to find `.md` file in directory: `${PRD_ROOT}/.../story.311.2.example-notifications/*.md`
+2. Found: `story.311.2.example-notifications.md`
+3. Check for QA reports: `${PRD_ROOT}/.../story.311.2.example-notifications/*.qa.*.md`
+4. Check for gate files: `${PRD_ROOT}/.../story.311.2.example-notifications/*.gate.*.yml`
+5. Proceed with DoD verification workflow (Steps 3-8)...
+
+## Resources
+
+### references/
+
+**`references/definition-of-done-checklist.md`**
+Comprehensive DoD checklist with:
+
+- Core acceptance criteria verification patterns
+- Story-type-specific security checklists (API, UI, Data, Auth, Infrastructure)
+- Compliance checklists (GDPR, PCI-DSS, WCAG, HIPAA, etc.)
+- Decision matrix for acceptance
+- Gap reporting formats
+- Accepted status formats
+
+Load this file to understand detailed verification criteria for each DoD category.
+
+**`references/story-status-schema.md`**
+Story/task status schema and frontmatter structure:
+
+- Valid status values and workflow
+- Frontmatter structure for stories and tasks
+- Required fields for `accepted` status
+- Frontmatter update rules
+- PR number format patterns
+
+Load this file to understand how to properly update story/task frontmatter.
+
+### assets/
+
+**`assets/sprint-review-summary-template.md`**
+Template for generating Sprint Review summary documents. Contains sections for:
+
+- Summary and acceptance criteria met
+- Key features implemented
+- Technical details and files modified
+- Testing & QA information
+- Security & compliance verification
+- Documentation updates
+- Demo notes and impact assessment
+- Known limitations and future work
+
+Use this template to generate the Sprint Review summary artifact when marking a story as accepted.
+
+## Notes
+
+- **Always verify ALL DoD criteria** before marking as accepted - no shortcuts
+- **Be specific in gap reports** - provide actionable feedback, not generic statements
+- **Security and compliance are mandatory** - never skip these reviews
+- **Generate artifacts consistently** - use the templates provided
+- **Communicate clearly** - users should understand exactly what's missing or what was accepted
+
+# Finalise Story Verification
+
+## Steps (complete ALL before stopping):
+
+1. Read the story file and extract ALL Definition of Done criteria
+2. For EACH criterion, search the codebase for evidence (use Grep, Glob, Read)
+3. If a search returns empty, try 2 alternative search patterns before marking ⚠️
+4. Output a full checklist: ✅ Met | ❌ Not Met | ⚠️ Inconclusive
+5. Summarize with a PASS/FAIL verdict and list any blocking items
+
+NEVER end without producing the full checklist output.
+
+---
+
+## Pipeline Lock Cooperation (when invoked by `/develop-story` or `/develop-task`)
+
+When this skill is invoked as a step in a develop pipeline, advance the pipeline lock as the **last action** before returning, so the orchestrator's next turn does not depend on model discipline:
+
+```bash
+if [ -f .claude/state/develop-pipeline.lock ]; then
+  bash .agents/skills/finalise/references/advance-pipeline-lock.sh --skill finalise 2>/dev/null || true
+fi
+```
+
+Idempotent in every degraded path: noops when the lock is missing (skill invoked standalone), already advanced past this step, or the helper script is not installed. Full rationale and cooperation order with the `Stop` hook: see [`references/pipeline-lock-cooperation.md`](references/pipeline-lock-cooperation.md).

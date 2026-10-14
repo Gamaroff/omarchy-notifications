@@ -1,0 +1,640 @@
+<!-- AUTO-GENERATED — DO NOT EDIT. Source: shared/resources/probe-boundary-rule.md. Regenerate via `npm run bundle`. -->
+# The probe boundary rule
+
+> The argument beside the mechanism. `security-probe.mjs` is the mechanism; this
+> file is why it is shaped the way it is, and what it may not claim. Read this
+> before changing either.
+
+Pairs with [`qa-runnable-prose-detection.md`](qa-runnable-prose-detection.md),
+which does the same job for the snippet path.
+
+---
+
+## 1. Why a probe is not a snippet
+
+`qa-execute-snippets.mjs` executes **text extracted from a markdown fence**. The
+document chooses the command; the harness only decides whether to allow it. That
+is why its safety model is an allow-list that fails closed, and why `bug.3` and
+`bug.6` between them document **26 routes past that classifier** — every one of
+them a way of writing a command that reads as safe and is not.
+
+A probe is a different trust class:
+
+| | Snippet execution (task.67) | Probe execution (task.80) |
+| --- | --- | --- |
+| Subject | text extracted from a markdown fence | a named export in this repository |
+| Who chooses the command | the document | the engine |
+| Caller supplies | the whole command line | a module path, an export name, and input **values** |
+| Gate | command allow-list | resolved-path containment; inputs never reach a shell |
+
+The engine constructs its own runner. The caller never names a command, so there
+is no command to allow-list. Inputs cross to the child as **JSON on stdin** —
+never interpolated into a shell string, never placed on argv — so no
+caller-authored value is ever parsed as code.
+
+**One form is the stated exception, and it does not reopen the snippet path.**
+`fence:` (task.180, §5) runs a fenced bash block, and its slot puts the case's
+input into the block's **source** — because that is what the document's reader
+does with the placeholder, and a probe that substituted differently would test a
+different block. Three things keep it a probe and not a snippet: the caller names
+**one** block by heading in a containment-checked file, never "every fence"; the
+engine chooses the command (`<shell> <script>`); and the run is the probe
+engine's sandbox — per-case directory, sandbox `HOME`/`TMPDIR`, escape sentinel —
+invoked by a reviewer, never by the QA snippet path. `SAFE_COMMANDS` is untouched
+(§2).
+
+## 2. The refusal: `node` must never join `SAFE_COMMANDS`
+
+**This is the shortcut, and it is refused.**
+
+Making a probe runnable through the snippet path requires an interpreter on
+`SAFE_COMMANDS`. It is one line. It looks like a small change. It is not.
+
+`SAFE_COMMANDS` gates untrusted prose. Adding `node` to it does not make *probes*
+runnable — it makes **every fenced bash block in every document** able to run
+arbitrary code through the QA path, because the classifier cannot tell a probe's
+`node` from a document's `node`. The allow-list stops being an allow-list at the
+moment it admits a general-purpose interpreter: everything behind it becomes
+reachable by writing four characters inside a fence.
+
+The 26 documented fail-open routes are the evidence for how hard that boundary
+already is to hold **while it excludes interpreters**. Widening it is not a
+one-line change to a list; it is a decision to stop having the boundary.
+
+This refusal is asserted in code, not only here:
+
+```
+references/tests/qa-execute-snippets.test.mjs
+  → "task.80 parity: no interpreter is on the snippet allow-list"
+```
+
+That test enumerates `node`, `nodejs`, `python`, `python3`, `ruby`, `perl`,
+`php`, `deno`, `bun` and `osascript` against both `SAFE_COMMANDS` and
+`COMMAND_RUNNERS`. If you are reading this because that test went red, the
+answer is not to update the test.
+
+## 3. How the verdict is derived — the load-bearing inference
+
+The corpus (`security-input-corpus.mjs`, task.79) gives each case a `correct`
+field, and `correct` is **human-readable prose**. "REJECT a host component
+containing `/`, `?`, `#`, `@` or whitespace" is an instruction to a reader, not a
+predicate a machine can evaluate.
+
+So "hostile cases handled as `correct` says" is derived from `direction`, which
+is the machine-readable half of the same statement:
+
+- **hostile** → the control *should* reject. An accepted hostile case means the
+  vulnerability **reproduces**.
+- **legitimate** → the control *should* accept. A rejected legitimate case is
+  **over-blocking**.
+
+A control "rejects" by throwing, or by returning `null` / `undefined` / `false` —
+the non-throwing rejection shape a validator commonly uses — or by returning a
+**result object whose own `ok` is `false`** (`{ ok: false, problems }`, the shape
+`report-lint.js#lintReport` answers with; task.131). Treating any of these as
+acceptance would score a working control as absent: before the result-object rule,
+every report `lintReport` refused scored `accepted`. The rule is narrow — own
+property, strictly `false`, a plain non-array object — so no other return value
+changes meaning.
+
+A JS export whose second argument is plain configuration — `lintReport(text,
+{ sections })` — is probed with `--args-json '[…]'`: a JSON array the caller states,
+appended after every case's input. The engine never guesses an argument; without
+the flag such an export throws on every case, which scores `rejects-every-input`,
+not a verdict.
+
+The verdict branches, in the order they are checked:
+
+| Condition | Verdict | Why |
+| --- | --- | --- |
+| nothing executed | `unverifiable` | Zero cases is never a pass. This is the defect the whole series exists to close. |
+| no **hostile** case executed | `unverifiable` | Legitimate cases alone are evidence the function runs, not that it guards. |
+| a hostile case reproduced, **none** rejected | `absent` | Nothing is filtering anything. |
+| a hostile case reproduced, **some** rejected | `present-but-inert` | A control demonstrably **exists** and demonstrably let a hostile case through. |
+| none reproduced, ≥1 legitimate accepted | `engages` | The control holds and does not block real traffic. |
+| none reproduced, **0** legitimate accepted | `unverifiable` | See §3.2. |
+
+### 3.1 `present-but-inert` is the high-severity verdict
+
+Worse than `absent`, and the ordering is not intuition. An absent control is a
+gap someone will eventually notice. An inert one has **already been reviewed and
+believed** — a reader opened the file, saw a validation branch, and moved on. The
+probe is the only thing that distinguishes them, because from the source they
+look identical.
+
+The fixture that produces it (`tests/fixtures/security-probe/inert-control.mjs`)
+rejects whitespace and `@` and passes `/`. A reviewer reading it sees a control.
+
+### 3.2 A function that rejects *everything* does not engage
+
+This is the branch most likely to be removed by someone simplifying the logic, so
+it is stated plainly: **`engages` requires at least one legitimate case to pass.**
+
+A stub that throws unconditionally rejects every hostile case. Under the naive
+rule "no hostile case reproduced → engages", an unimplemented control scores a
+clean probe. That is the same failure as a self-reported `probes_executed: 0`,
+wearing different clothes — a control that was never written reporting that it
+works.
+
+So: hostile-rejection alone is not evidence of a control. It is evidence of *a
+function that says no*, which is also what a `throw new Error("TODO")` is.
+
+## 4. `declined` is its own state
+
+`declined` is **never** folded into `executed: 0`.
+
+Both render as "nothing ran", and they answer different questions:
+
+- `executed: 0` — the engine reached the target and found nothing to run.
+- `declined` — the engine refused, or could not reach the target at all.
+
+Collapsing them makes a broken probe indistinguishable from a clean one. This is
+the defect `task.73` chased through four QA cycles, and `bug.7` documents the
+same shape one layer up.
+
+Declining conditions, each reported with its reason:
+
+| `reason` | Meaning |
+| --- | --- |
+| `bad-entry` | The entry spec is not `path#exportName`. |
+| `outside-repo-root` | The resolved path escapes the containment root. |
+| `unknown-sink` | No corpus for that sink. `corpusFor` throws rather than returning `[]`, deliberately. |
+| `entry-not-probeable` | The module would not import, the export is absent, or it is not a function. An **absent** export is a module-private predicate: export it and re-run — never a reason for `boundary: false` (obs #156). For `fence:`: the heading is not in the doc, appears twice, or has no ```` ```bash ```` block under it. |
+| `case-errored` | One case timed out or its child never ran. |
+| `bad-args` | `--args-json` is not a JSON array, or was given with a `shell:` / `shell-fn:` / `cli:` / `shell-argv:` / `fence:` entry, which cannot append an argument to a call. |
+| `bad-slot` | A `fence:` entry with no `--slot`, a `--slot` the block does not contain (a slot that substitutes nothing tests nothing), or a `--slot` given with any other form. |
+| `bad-fixture-setup` | A `--fixture-setup` given with any form but `shell-argv:`, or one outside the containment root, under `node_modules`, or not a readable regular file. |
+
+### `boundary: internal` is a decision, not a verdict
+
+`declined` and `executed: 0` describe a probe. `boundary: internal` describes the
+**decision not to run one**, and it is recorded as a third value of the Step 1b
+`boundary:` field (`true | false | internal`), never folded into either of the
+others. It is available only when **both** hold:
+
+- the predicate's only input is an artefact this repository's own pipeline writes —
+  an implementation report, a DoD summary, a gate file; **and**
+- no corpus sink's legitimate cases are documents that predicate is meant to accept.
+
+It requires an `internal_reason` that begins with the entry (`path#export`) and names the artefact
+and why no sink fits; an entry the prompt's *Entries disqualified from `internal`* table lists is
+probed, never recorded `internal`, and `/finalise` Step 3c forces FAIL on it; an
+`internal` without one is a FAIL (the `internal boundary recorded without a reason` check, and `/finalise` forces
+the security result to FAIL on that shape — `finalise-dod-security-prompt.md` states it). **A sink disqualifies it for the shape it
+models**: `markdown-structure` models the implementation report, so
+`report-lint.js#lintReport` is `boundary: true` and probed. A validator of any
+other document is not disqualified by that sink — probing it there would score
+the sink's legitimate reports `overblocked` for being the wrong document, which
+says nothing about the validator. A validator of **external** input is never
+`internal`.
+
+The class exists because the zero-guard had two outcomes and met a third shape:
+on task.124 the finalise agent classed `lintReport` a boundary, found no sink and
+no way to pass its second argument, and returned the zero-guard FAIL —
+a verdict the operator then overruled by hand. A rule that ends in "a human
+decides" on a recurring shape is a rule with a missing branch; `internal` is that
+branch, and the sink plus `--args-json` are why `lintReport` itself no longer
+takes it.
+
+## 5. Containment, and what it does not cover
+
+**What the engine does:**
+
+- Resolves the entry path and rejects anything outside the repository root
+  **before importing**. `import()` runs the module's top level, so a post-hoc
+  check would fire after arbitrary code had already executed. The check is on the
+  *resolved* path, so `a/../../etc/x` is caught and a legitimate relative path
+  containing `..` is not refused for looking suspicious — and on the **real**
+  path, both sides: an existing entry and the root are passed through
+  `realpathSync` before the comparison, so a symlink inside the tree that points
+  out of it is refused `outside-repo-root` before anything imports or spawns it,
+  and a root reached through a symlink still contains its own files (task.140 —
+  the limit carried since task.128 gate 1, closed).
+- Runs each case in **its own child process**, so a hang, a throw or a
+  `process.exit` is contained and attributable to one case rather than killing
+  the run.
+- Gives the child the same **minimal environment** as the snippet path —
+  `sandboxEnv()` from `qa-execute-snippets.mjs`, six keys, an allow-list — so no
+  parent token reaches a probe.
+- Watches a **sentinel directory** beside the working copy with `snapshotTree()`
+  and reports any write that escapes, whatever the probe claimed to do.
+- Takes its per-case timeout from the **shared spawn budget**
+  (`spawn-budget.mjs`), never a literal.
+
+**What it does not do, stated honestly:**
+
+- **There is no OS-level sandbox.** The module under probe runs with full Node
+  privileges — exactly as `qa-runnable-prose-detection.md` §3aa already says of
+  the snippet path. The containment contains *the harness*, not the repository.
+- **A path that does not exist yet is contained by its deepest existing
+  ancestor**, realpath'd, with the missing segments re-joined — so a missing leaf
+  under a symlinked intermediate is refused where the link really points, and a
+  missing file under a symlinked root stays inside it. The residual is a symlink
+  that appears between the containment check and the readable-file check, a race
+  nothing here defends against.
+- **The engine reaches six entry forms, and "not importable" is not a decline.**
+  `path#export` imports a JS module; `shell:path` runs a **shell script that
+  takes one positional argument** — `bash <script> <fixture-dir>` per case, under
+  bash and (when the host has it) zsh, with the script and directory passed as
+  argv, never as a string, stdin closed, `sandboxEnv()` plus `LC_ALL=C`. A sink
+  the corpus marks *materialised* (`MATERIALISED_SINKS`; today `filename`) is
+  written to a fixture directory beside its bracketing controls, and the case's
+  `expected` — stdout, exit, stderr, paths that must be absent — is what the run
+  is compared against. Same case loop, same verdict, same record, and each
+  (case, shell) run is one executed probe. **A bash boundary that was recorded
+  `boundary: false` because it had no export was the task.121 failure** (five
+  gates at `probes_executed: 0` against a script that says it refuses rather
+  than guesses); the shell form is what removes that reason for zero. It does
+  not soften the guard: zero executed is still `unverifiable`.
+
+  **`shell-fn:path#function` sources a library and calls the function** with the
+  case's input as its argv, per case under the same shells, with rc files off
+  (`bash --noprofile --norc` / `zsh -f`) on top of the sandbox `HOME` — because
+  this form sources *into* the shell, where `shell:` only ever runs `bash
+  <script>`. **The header signal that tells the two shell forms apart:** a file
+  whose header says *source it* (`source references/x.sh || exit 1`, then call
+  `fn`), or that defines functions and makes **no top-level call**, is a
+  library — probe it with `shell-fn:`. Run through `shell:` such a file defines
+  its function and exits 0 with nothing on stdout, so every case mismatches and
+  the verdict reads `absent` behind a full count with `escaped 0` — **the
+  task.125 result** (`gh-labels.sh#gh_labels_filter`, 28 identical `"" ≠ "12\n"`
+  mismatches, a human override at the gate). Two consequences the caller owns:
+  - **A function's `expected` is not the sink corpus's.** The `filename` corpus
+    describes a script that prints the highest gate number; a label filter never
+    prints `12`. Name a cases file with `--cases-file <path>` whose `expected`
+    is the function's own contract (`tests/fixtures/shell-fn/gh-labels.cases.json`
+    is the one for `gh_labels_filter`); keep `--sink filename` — it selects the
+    materialised fixture directory the runner runs in. **A cases file carried
+    from an earlier cycle is re-checked before a reproduced case is reported:**
+    compare the case's `expected` with the committed suite's own cases and with
+    what the latest fix changed. A stale expectation is a cases-file edit, not a
+    finding (task.177 reported two at QA cycles 2 and 3). Prefer re-deriving the
+    cases each cycle (obs #259).
+  - **A function or script whose body names `gh` is answered by a fixture, not
+    the network:** add `--fake-gh <dir>`, a directory holding an executable `gh`
+    (this repository's is `tests/fixtures/fake-gh`; a consumer supplies its
+    own). The engine prepends it to `PATH` with `FAKE_GH=1` in the env — the
+    fixture refuses to run without that variable — validates it before anything
+    spawns (`bad-fake-gh` otherwise, decided on real paths like an entry's, so a
+    symlink inside the root that points out of it is refused), and records it as
+    `fake_gh` on the run.
+    **A library or script whose text — or the text of a file it `source`s at top
+    level — names `gh`, and was given no `--fake-gh`, is declined
+    `needs-fake-gh`, not scored**, under **both** shell forms (task.140; the
+    `shell:` form ran the host `gh` before it). "Names" means `gh` as a command
+    word — after whitespace, `;`, `|`, `&`, `(`, a backtick, `$`, a quote or a
+    backslash, and followed by whitespace, `;`, `|`, `&`, `)`, `>`, a quote or end of
+    line — or a variable named `GH` (`"$GH" api`); a `source` / `.` is followed at
+    the start of a line or after `;`, `&&`, `||`, `then` or `do`, its path tried
+    against the library's directory, then the root, one level deep, and is not followed when
+    it holds a `$` or lies outside the root. A mention in a comment matches too;
+    that is a decline the caller answers by passing the fixture. **That text
+    check is only the fast path; the guarantee is at run time.** With no
+    `--fake-gh`, a **trip-wire `gh`** is first on `PATH`: it records the call and
+    exits 127, so the host `gh` never runs, and a run that reached it is declined
+    `needs-fake-gh` with nothing scored — whatever the spelling (`${GH_BIN:-gh}`,
+    `GH_CLI=gh; "$GH_CLI"`, a wrapper however it sources `gh-labels.sh`), and
+    under `env -i PATH="$PATH"` too: the stub carries its marker path in its own
+    text, not in the environment. The decline still reports what the runs
+    observed — `escapes`, `cases`, `shells` — as `entry-not-probeable` does: an
+    unscored run's side effect is still a side effect (task.140 QA cycle 3). A
+    library that mentions `gh` but never calls it is scored. **The limits** — each
+    reaches a real `gh` with nothing recorded, and the run is scored: an
+    **absolute path** to a real `gh` (it bypasses `PATH`); a library that puts
+    another directory **ahead of the trip-wire on `PATH`** (`export
+    PATH="/usr/local/bin:$PATH"`) — with `--fake-gh` given this bypasses the
+    fixture too, and the record still names the fixture; and a `gh` call
+    **backgrounded past the spawn**, which runs after the sandbox and its
+    trip-wire are gone. Rows pin the absolute path and the `PATH` prepend
+    (task.140 QA cycles 2 and 4). All three behave the same before task.140;
+    closing them is follow-up work. Otherwise: run bare, the real `gh` fails from the
+    sandbox cwd, the function takes its read-failed passthrough, and the verdict
+    would land on `absent` / `present-but-inert` — the values a missing control
+    produces — with nothing but `fake_gh: null` to say "could not look". The
+    decline names the library and the flag; it does not hang.
+
+  Exit 97 is reserved for "the source itself failed" and 98 for "the function
+  is not defined after sourcing"; both fold into one `entry-not-probeable`
+  decline that names the library, never into a scored `absent`. During the
+  `source` an EXIT trap is armed **and `exit` is shadowed by a function** that
+  calls `builtin exit 97`, so a **top-level `exit` inside the library** (a
+  `|| exit 1` guard, say) is the same named decline even when the library has
+  installed its own `trap … EXIT` first. **The decision, though, is a positive
+  marker, not an exit code**: once the source has returned 0 the body writes a
+  per-spawn marker under the work dir, and the runner declines whenever it is
+  absent — so every way the shell can die during the source reads the same: an
+  explicit exit, errexit, a replaced EXIT trap however it was installed (`trap …
+  exit`, `builtin trap`, `command trap`, zsh's `TRAPEXIT`), `exec`. Filtering how a
+  library installs a trap is an enumeration over shell syntax with no last entry
+  (task.140 QA cycle 2). `exit` is unset before the function under probe runs,
+  and a `TRAPEXIT` the library defined is unset too; a library that defines its
+  own `exit` loses it (none here does). The source's status is taken as a **simple command**, not on
+  the left of `||` — where both shells suspend errexit for everything the
+  library runs at top level — so a `set -e` library whose top-level command
+  fails is declined, as a consumer's own `source` would have aborted, rather
+  than sourced to completion and scored (task.140). The function itself runs in a **subshell** with
+  the library's own errexit setting restored inside it, so a function that
+  calls `exit` cannot end the harness, `set -e` in the library cannot skip the
+  status capture — and its own 97 or 98 is re-mapped to 99 and *scored* as a
+  mismatch rather than read as a broken library. Because the input reaches the function
+  as argv and not as a directory entry, a `shell-fn:` case may carry a `/`
+  (`area/backend` is a real label); no per-case file is written for this form,
+  only the sink's controls. `--fake-gh` on a JS-form entry is `bad-fake-gh`:
+  the JS runner never consults `PATH`, and a fake it cannot reach must not be
+  recorded as having answered. A stdin-reading function, or one needing more
+  than argv, is still declined (§ Out of Scope, task.128).
+
+  **`cli:path --argv '<JSON array>'` runs a Node CLI** — a `.mjs` / `.js`
+  script — as `node <path> ...argv`, one probe per case, for the boundary that
+  lives behind a **flag parser** rather than a one-argument export (task.141's
+  `uat-status.mjs --env` guard sits behind a three-argument function; the JS
+  form could not reach it, and the gate recorded zero probes executed). The
+  template is a JSON array of strings with **exactly one `"{input}"` element**,
+  which becomes the case's input as one argv element, never split and never
+  parsed by a shell, and optionally `"{fixture}"` elements, which become the
+  case's fixture directory (the sink's controls plus the case's name for a
+  materialised sink, otherwise empty). **A slot is a whole element or nothing** —
+  `--env={input}` is refused, not interpolated — so no argument is ever built
+  by concatenating probe input into a string. The sandbox is the shell arm's:
+  the fixture is the cwd and sits inside the sandbox root, `HOME` and `TMPDIR`
+  point inside it, stdin is empty, and the script's own directory is watched.
+  Three rules the caller owns:
+  - **The verdict is the exit status.** Exit 0 is *accepted*, non-zero is
+    *rejected*. That is a contract the CLI must honour: one that exits 0 while
+    refusing is scored as accepting. A case that needs a finer signal carries
+    `expected` (stdout, exit, stderr, absent paths), which is then compared and
+    mapped through `direction` exactly as the shell arm does it.
+  - **A crash is not a refusal.** An uncaught error — Node's own `Node.js
+    vX.Y.Z` footer on stderr — a kill, or a timeout is *errored*: "could not
+    look". A script that fails to load therefore folds into one
+    `entry-not-probeable` decline instead of scoring as a control that rejects
+    every hostile input. **Only an uncaught error carries that footer**: a CLI
+    that catches its own failure and exits non-zero (a top-level
+    `main().catch(…)` handler) looks exactly like a refusal and is scored
+    *rejected* — **a false pass** on a hostile case, because a crash reads as
+    a refusal. Give such a case an `expected` that only a genuine refusal
+    produces (the refusal's own stderr line, say): the crash then mismatches,
+    and a hostile case scores **accepted** — reported as a reproduction. That
+    turns the false pass into a false alarm a reader will investigate, which is
+    the direction to err in. Neither makes the crash *errored*: only Node's
+    uncaught-error footer, a kill or a timeout does.
+  - **A materialised sink writes the case's name into the fixture.** For a sink
+    in `MATERIALISED_SINKS` the fixture directory holds the sink's controls
+    *and* a file named by the case's input — the cwd, and `{fixture}`, are what
+    the CLI would list — so a name a file cannot carry (one with a `/`) is
+    declined as it is in the `shell:` arm. An argv-only input such as
+    `area/backend` belongs under a non-materialised sink (or `--cases-file`
+    with one), where the fixture is empty and nothing is declined.
+  - **There is no escape for a literal `{input}`.** Every whole-element
+    `"{input}"` or `"{fixture}"` is a slot, and any other element containing
+    one is refused — so a template cannot hand its target the literal string
+    `{input}` (a CLI whose own argument is a template, the engine itself
+    included). Pass such a value as the case's input instead.
+  - **A `--argv` shape error is an argument error, not a probe result:** exit 2,
+    `bad-argv`, nothing runs and no record is written (`--argv` without `cli:`
+    or `shell-argv:`, `cli:` or `shell-argv:` without `--argv`, zero or two `{input}`, an unknown or embedded
+    slot). An entry outside the root, or one that is not a `.mjs` / `.js`
+    regular file, is a named decline like every other form's. The record carries
+    the template as `argv`, and **a `cli:` control's identity is its
+    `--name`**: two probes with different names are two controls, and a re-run
+    under the same name replaces its own entry whatever else in the template
+    changed — including a probe **declined** before it ran (an entry outside a
+    wrong `--repo-root`), whose corrected re-run replaces the `unverifiable`
+    entry rather than recording beside it. **Name every `cli:` probe** — the
+    prompts already pass `--name` for every control. An *unnamed* `cli:` control falls back to its **argv
+    skeleton**: every flag and every bare positional, in order, with only the
+    *values* of flags dropped (`--root /tmp/x` → `--root *`, `--cases=/a.json` →
+    `--cases=*`) and the slots kept. The skeleton is a derived key, and every
+    derived key has a counter-example: two controls that differ only in a flag
+    **value** that selects behaviour (`--mode strict` / `--mode lax`) share one
+    skeleton, a per-run path passed as a bare positional splits re-runs, and
+    an element after a *boolean* flag is read as that flag's value. So when an
+    unnamed write replaces an entry whose full `argv` differs, the CLI prints a
+    `warning: replaced control …` line and the write still happens — the
+    remedy is `--name`, not a reordered template.
+
+  `cli:` does **not** touch §2: the engine chooses the interpreter
+  (`process.execPath`) and the script is fixed by `--entry` and
+  containment-checked before anything spawns, exactly as the JS form already
+  runs a Node child. `node` stays off `SAFE_COMMANDS`.
+
+  **`shell-argv:path --argv '<JSON array>'` runs a bash script that takes
+  several arguments or flags** (task.181) — `verify-push-state.sh --base …
+  --scope …`, `grant-qa-cycles.sh <doc-dir> <k> [<report>]`,
+  `reenter-qa-after-finalise.sh <doc-dir> <report>` — which the one-positional
+  shell form cannot reach. It is `cli:`'s contract on a shell script: the same
+  template grammar (one `"{input}"` element, never split, never parsed by a
+  shell; `"{fixture}"` elements), the same verdict (exit 0 *accepted*, non-zero
+  *rejected*, `expected` compared when a case carries it), the same record
+  (`argv`, and a control keyed on its `--name`, else its argv skeleton). Per
+  case and per shell, **the shell is the caller and bash the interpreter** —
+  `<shell> -c 'bash "$@"' <shell> <script> ...argv` — as the one-positional
+  form does: the script's shebang fixes its interpreter, and a bash script interpreted by zsh
+  would fail on a bash construct and score as a refusal. A timeout or a launch
+  failure is *errored*. Two things `cli:` never needed:
+  - **`--fixture-setup <path>`** names a committed shell script, contained like
+    the entry, run as `bash <setup> <case-dir>` before each (case, shell) run, in
+    the same sandbox and env. It is how a case gets the scratch git repository
+    these scripts read — commits, a gate whose `head:` is an ancestor, a halt
+    snapshot. The sandbox `HOME` has no git identity, so the setup states one
+    (`git -c user.name=… -c user.email=…`). **A setup that fails is *errored*,
+    never *rejected*** — the engine could not build what the script needs. **A
+    setup builds `"$1"` and nothing else:** its writes are watched in their own
+    list, never charged to the entry, and a write anywhere else — the sandbox
+    `HOME` or `TMPDIR`, a sibling case, the harness — also errors that run,
+    named, because it leaves the entry's escape baseline unknown. A setup that
+    needs scratch space makes it inside `"$1"`. The entry's own runs are watched
+    beside the case directory as `fence:`'s are, so a write to a sibling case or
+    a deletion in the harness is an escape.
+    `--fixture-setup` with any other form is exit 2, `bad-fixture-setup`; the
+    record carries it as `fixture_setup`.
+  - **A case's `fixture`** (`env`, `files`) is honoured exactly as `fence:`
+    honours it, and is written **before** the setup runs, so the setup may rely
+    on it.
+
+  It is a shell form for `gh`: a script, a setup, or a case fixture's `env`
+  values or `files` contents that name `gh` with no `--fake-gh` are declined
+  `needs-fake-gh` (the case input is argv data and is not read), every `PATH`
+  directory holding the host `gh` is shadowed (`ghFreePath`, as for `fence:`),
+  the trip-wire `gh` is first on `PATH`, and `--fake-gh` is accepted. Like `cli:` it does not touch §2: the engine
+  chooses the interpreter (`bash`), and the script and the setup are fixed by
+  flags and containment-checked before anything spawns. The worked example is
+  the `shell-argv` fixture pair beside `security-probe.test.mjs` — a setup and
+  eight cases against `reenter-qa-after-finalise.sh`, `engages`, every case past
+  its usage line.
+
+  **`fence:<doc.md>#<heading>` with `--slot <placeholder>` runs a fenced bash
+  block in a step doc** (task.180) — the shape most of this repository's
+  preconditions, refusals and guards ship in, which until this form were probed
+  zero times by the engine and closed with a hand-written wrapper under the gitignored
+  `.claude/state/` (task.159, task.167). The engine reads the doc **on every
+  run**, finds the heading among the lines **outside** fences (a bash
+  `# comment` is not a heading), and takes the first ```` ```bash ```` block
+  before the next heading of the same or a higher level. Every occurrence of the
+  slot's text is replaced by the case's input, and the result runs as a script —
+  `<shell> <script>` per case under bash and (when present) zsh, rc files off,
+  cwd the case's own directory. **The slot is source substitution, not data:**
+  the input becomes script text, exactly as it does for the document's reader,
+  so a `$(…)` in it runs; its effects land in the case directory, inside the
+  sandbox, and a write elsewhere in the sandbox is an escape — under the work dir
+  that holds the case directories, so is a deletion or a new directory. **A write
+  to an absolute path outside the sandbox is not observed** (an injected
+  `$(touch /abs/x)`): it is a stated limit, pinned by a test, and `expected.absent`
+  cannot name such a path. With no `--fake-gh`, the `gh` text check below runs over
+  the extracted block and every case's input and fixture `env` / `files` (never the
+  whole document), so a block
+  that resolves `gh` to a path is declined `needs-fake-gh` before anything runs. That
+  check is the fast path; the guarantee is structural: for each case, every `PATH`
+  directory that holds a `gh` is replaced by a copy without it (`ghFreePath`), so no
+  `PATH` lookup — `type -ap gh`, `command -v gh`, from the block, an input or a
+  fixture script — reaches the host binary. An absolute path, a `PATH` the block
+  itself prepends, and a default-path lookup (`command -p gh`, `env -u PATH gh`,
+  which search `/bin:/usr/bin`) remain the limits; the text check catches the last
+  wherever it is written out in the block, an input or a fixture. A case's optional `fixture`
+  supplies the rest of what the block reads — `env` (never `HOME`, `TMPDIR` or
+  `LC_ALL`, which the sandbox owns) and `files` written into the case directory,
+  declined when a path leaves it. **A hostile case must carry `expected`** — the
+  guard's own refusal **output**, a non-empty stdout or stderr — and is declined
+  without one, or with one that is only an exit code or an empty output: under
+  source substitution an exit status cannot tell a refusal from a shell that
+  stopped on the input (`${x:?}`, a word-split `cd`) or from an injected
+  `exit`, and reading the shell's stderr to tell them apart failed in three
+  consecutive QA cycles (task.180). A guard that refuses silently is therefore
+  declined here, never scored. A legitimate case without `expected` is scored
+  by exit status, `cli:`'s rule. A generated script that does not parse
+  (`<shell> -n`) is `errored`. The order these rules apply in is
+  `scoreFenceRun`'s, stated once in the engine. The record names
+  `fence:<doc>#<heading>`, which resolves in every checkout, and carries the `slot`;
+  a `fence:` control is keyed on its `--name`, else its slot, so two slots probed on
+  one block stay two controls. **"It is prose, not
+  a script" is never a reason for `boundary: false`**: a guard shipped as a
+  fenced block is a boundary by what it does, and `fence:` reaches it. Like
+  `cli:` it does not touch §2: the caller names one block, the engine chooses
+  the command, and the sandbox, the per-case directory and the escape sentinel
+  all apply unchanged.
+- **What is still declined, and recorded as declined:** a script or CLI that
+  reads its input from stdin, anything that must open a socket; a live database sink; anything that needs
+  the network (a CLI that consults `gh` included — `--fake-gh` is a shell-form
+  flag). These are limits of the entry forms,
+  not reasons to record `boundary: false` — the boundary exists whether or not
+  the engine can reach it, and §5.1 is how it is tested.
+- **No probe opens a network connection.** Both motivating defects are pure
+  composers; if a target needs the network, that is a decline.
+- **A probe sees one input, not the population behind it.** When the
+  boundary's output is an identity — an id, key or path another command later
+  resolves — build the fixture through the producer the real path uses (the
+  engine's own scan, say), in a population that holds a colliding sibling
+  (same key, different record), and assert where the downstream resolver
+  lands, not only whether the boundary accepted the input. One entry per
+  fixture cannot see a coercion upstream or a first-match resolve downstream;
+  task.150 spent three QA cycles finding them one layer at a time (obs #209).
+
+The precondition — a pure-ish predicate, composer, single-argument script,
+argv-driven Node CLI or shell script, or fenced bash block with one
+placeholder — is what the
+boundary rule selects for anyway. If it turns
+out that most real controls are reachable by none of the forms and the engine declines almost
+everything, **that is a finding to record here in this section**, not something
+to paper over by loosening §2.
+
+### 5.1 When the sink is declined and the reviewer probes it by hand
+
+A declined sink (a stdin-reading script or CLI, a networked control — what no
+entry form reaches) is not exempt from being tested; it is exempt from the
+*engine*. **Reach for this only after the entry forms have been tried** — a
+one-argument script is `shell:`'s job, a shell script taking several arguments
+or flags is `shell-argv:`'s (with `--fixture-setup` when it needs a
+repository), a Node CLI driven by its argv is `cli:`'s and a fenced bash block
+in a step doc is `fence:`'s, and a by-hand probe of any of them is the self-report the engine
+exists to remove. A `cli:` probe exercises **one arm**
+— the CLI's own argv; the other arms below (a wrapper, an env-var path) still
+need the by-hand rule when they reach the same sink. When the reviewer executes such
+candidates itself, two rules apply that the engine would otherwise have enforced:
+
+**Every refused shape is re-tried through every arm that reaches the same sink.**
+A CLI has more than one way in — its own argv, a `--` passthrough, a wrapper such
+as `npm run` / `npx`, a path taken from an environment variable — and each arm
+parses independently. On task.111 the absolute-path form was refused by the first
+arm tried and the enumeration stopped; the `npm run` wrapper passed the same
+string through untouched and reached the sink (obs #91). An arm is recorded clean
+only after the shapes refused elsewhere have been run through it, and the
+absolute form of any shape the arm accepted relatively has been run under the same
+arm. Record the arm × shape pairs tried, not only the verdict.
+
+**A by-hand probe runs under a minimal environment, in a scratch checkout, with a
+throwaway `HOME`.** The engine's `sandboxEnv()` allow-lists six keys for exactly
+this reason; a probe run from the reviewer's shell inherits the reader's entire
+session — API keys, `GH_TOKEN`, `CLAUDE_*`, npm config, and the `.claude/` /
+`.agents/` links of the working copy. On task.111 an executed candidate launched
+two agent sessions from inside the review (obs #97). The floor:
+
+```bash
+# Minimal env: only what the command under probe needs. Add keys deliberately.
+env -i PATH=/usr/bin:/bin:/usr/local/bin HOME="$(mktemp -d)" \
+  <command> <candidate>
+```
+
+and the working directory is a scratch clone (`git worktree add` of the PR head is
+enough) that carries no `.claude/`, `.agents/` or credential files. A probe that
+needs a variable the minimal env removed is a probe whose result must say so.
+Anything an executed candidate writes lands under the throwaway `HOME` or the
+scratch tree, and the reviewer diffs both afterwards — the by-hand equivalent of
+the engine's sentinel directory.
+
+### 5.2 Which deliverables the rule names — the signals live in one module
+
+The signal list a reader applies at Step 1b (finalise) and Step 3b (QA) is data,
+not only prose: `probe-boundary-signals.mjs` beside this file exports
+`BOUNDARY_SIGNALS` and `classifyBoundaryText(text)`, and the prompts' bullet
+lists are its `description`s. The fifth signal is the one task.121 lacked — **a
+script or function whose own header says it refuses, never guesses, or fails
+closed is a boundary by its own words, in any language.** `qa-cycle.sh`'s header
+("refuses rather than guesses") classifies as one; the task.121 gate-5 note ("the
+helper reads filenames and prints a bounded integer") carries no signal, which is
+why a reader applying only the JS-shaped ones recorded `boundary: false`
+against a script that said otherwise. A test calls the classifier on both.
+
+## 6. Exit codes
+
+`0` clean / `1` findings / `2` hard error, per the repository convention stated at
+the top of `qa-execute-snippets.mjs`.
+
+**`unverifiable` exits `1`, not `0`.** A CI check reading `$?` cannot otherwise
+tell "the control holds" from "we could not tell" — and making those two
+indistinguishable at the exit code is the same defect this engine exists to
+close, one layer further out.
+
+| Outcome | Exit |
+| --- | --- |
+| `engages` | 0 |
+| `present-but-inert` | 1 |
+| `absent` | 1 |
+| `unverifiable` | 1 |
+| **any verdict, with `escapes` non-empty** | **1** |
+| bad argument, unreadable `--cases-file`, invalid `--timeout` | 2 |
+
+**An escape overrides the verdict.** A probe that wrote outside its sandbox exits
+non-zero even when the control it was probing scored `engages`. The verdict
+describes the *control under probe*; the escape describes the *probe itself*, and
+a caller reading only `$?` must not be told the second was fine because the first
+was. The default (non-`--json`) summary line appends `ESCAPED n` for the same
+reason — the sentinel is the last line of containment, and it was previously the
+one result that line dropped.
+
+`--timeout` is validated with the same rule the spawn budget applies to its env
+vars: a plain decimal integer, minimum 1. `0` is rejected specifically because it
+parses cleanly and means **no timeout** to `spawnSync` — it reads as "be quick"
+and would silently remove per-case containment.
+
+---
+
+## See also
+
+- [`qa-runnable-prose-detection.md`](qa-runnable-prose-detection.md) — the same
+  argument for the snippet path, including §3aa on the absent OS sandbox
+- [`security-input-corpus.md`](security-input-corpus.md) — the corpus this
+  consumes (task.79)
+- [`mutation-proving.md`](mutation-proving.md) — the procedure every verdict
+  branch above was proved with
+- `probe-boundary-signals.mjs` — the signal list as data, and the classifier
+  a test can call (§5.2)
