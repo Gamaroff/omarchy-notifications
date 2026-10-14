@@ -28,7 +28,7 @@ Taken from the code and `manifest.json`. Versions are not pinned: the plugin run
 - No build step, no package manager, no dependencies to install.
 - Tests: Node's built-in `node:test` and `node:assert`, loading the `.pragma library` files through
   `node:vm`. Run with `node --test`. QML and the bash store have no automated tests.
-- Lint: none configured.
+- Lint: `shellcheck` on `bin/notification-center`, in the quality gate. QML and JS are not linted.
 
 ## Infrastructure
 
