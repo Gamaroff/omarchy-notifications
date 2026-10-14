@@ -15,7 +15,7 @@ own Linux desktop.
 - Tests: `node --test`, from the repo root (well under a second; 17 tests, no dependencies to install).
 - Lint: none configured.
 - Quality gate (also `skills-config.yaml` `develop.fastGateCommand` and `developNext.qualityGateCommand`):
-  not set. `skills-config.yaml` has neither key yet.
+  `node --test`.
 - Plugin check: `omarchy plugin validate <plugin-folder>` checks a folder against Omarchy's manifest schema.
 
 ## Layout
@@ -61,9 +61,9 @@ is never the running copy: develop and switch branches there freely.
 ## Releases
 
 - Version file: `manifest.json` (`version`).
-- Pushing `main` is what ships: the next `omarchy plugin update` picks it up.
-- Post-release step: `omarchy plugin update gamaroff.notifications`, then `omarchy-restart-shell` (the shell
-  caches QML).
+- Pushing `main` is what ships.
+- Post-release step: `omarchy plugin update gamaroff.notifications --yes`, then `omarchy-restart-shell` (the
+  shell caches QML).
 
 ## Gotchas
 

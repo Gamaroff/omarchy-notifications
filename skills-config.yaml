@@ -17,4 +17,12 @@ devLoadAlwaysFiles:
   - docs/architecture/concepts/tech-stack.md
   - docs/architecture/concepts/source-tree.md
 
+develop:
+  # The suite runs in well under a second, so it is cheap enough to run every iteration.
+  fastGateCommand: node --test
+
+developNext:
+  # No CI runs on PRs here, so this is the whole merge gate.
+  qualityGateCommand: node --test
+
 tracker: github
