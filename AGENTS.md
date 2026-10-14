@@ -52,7 +52,7 @@ at `~/.config/omarchy/plugins/gamaroff.notifications`, and `omarchy plugin updat
 remote default branch, `main`. Only released code runs. The dev clone `~/Development/omarchy-notifications`
 is never the running copy: develop and switch branches there freely.
 
-- The widget sits in the bar's center section, at index 5, with its own `mutedNotifications` setting in
+- The widget sits last in the bar's right section, with its own `mutedNotifications` setting in
   `~/.config/omarchy/shell.json` (managed by chezmoi). `omarchy plugin enable` keeps the position but drops
   the setting; `chezmoi apply ~/.config/omarchy/shell.json` puts it back.
 - The `omarchy plugin` commands fail with "omarchy-shell is not responding" under the default 2s IPC
